@@ -1,0 +1,15 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+.venv*/
+
+# Mac
+.DS_Store
+
+# Data
+data/raw/
+data/clean_py.jsonl
+model/checkpoints/
