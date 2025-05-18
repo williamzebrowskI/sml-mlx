@@ -26,7 +26,11 @@ train:
 	    --total_steps $(TOTAL_STEPS)
 
 eval:
-	$(PYTHON) model/eval.py --checkpoint model/checkpoints/latest.safetensors --tokenizer tokenizer/py50k.model
+	PYTHONPATH=. \
+	python -m model.eval \
+	    --checkpoint model/checkpoints/ckpt_final.safetensors \
+	    --tokenizer tokenizer/py50k_bpe.model \
+		$(ARGS)
 
 encode:
 	PYTHONPATH=. $(PYTHON) scripts/encode_jsonl.py \
