@@ -4,32 +4,36 @@ PYTHON := python
 .PHONY: data tokenizer train eval clean
 
 data:
-	python data/scripts/fetch_tinystories.py \
-		--output data/raw/tiny_stories.jsonl
-	python data/scripts/clean_code.py \
-		--input data/raw/tiny_stories.jsonl \
-		--output data/clean_text.jsonl
+	python data/scripts/fetch_wikitext.py \
+		--subset train \
+		--n_articles 50000 \
+		--output data/raw/wikitext_train.jsonl
 
 tokenizer:   ## trains tokenizer/py50k_bpe.{model,vocab}
-	$(PYTHON) tokenizer/train_tokenizer.py \
-	           --input data/clean_text.jsonl \
-	           --model-dir tokenizer \
-	           --model-type bpe \
-	           --vocab-size 50096 
+	python tokenizer/train_tokenizer.py \
+		--input data/raw/wikitext_train.jsonl \
+		--model-dir tokenizer \
+		--vocab-size 50096 \
+		--model-type bpe
 train:
-	PYTHONPATH=. \
-	$(PYTHON) -m model.train \
-	    --config model/config.json \
-	    --out model/checkpoints \
-	    --seq_len $(SEQ_LEN) \
-	    --batch_size $(BATCH_SIZE) \
-	    --total_steps $(TOTAL_STEPS)
+	python model/train.py \
+	  --config       model/config.json \
+	  --dataset      data/raw/wikitext_train.jsonl \
+	  --tokenizer    tokenizer/spm.model \
+	  --out          model/checkpoints \
+	  --context_size $(CONTEXT) \
+	  --batch_size   $(BATCH) \
+	  --total_steps  $(STEPS) \
+	  --lr           $(LR) \
+	  --warmup       $(WARMUP) \
+	  --steps_report $(REPORT) \
+	  --steps_checkpoint $(CKPT)
 
 eval:
 	PYTHONPATH=. \
 	python -m model.eval \
 	    --checkpoint model/checkpoints/ckpt_final.safetensors \
-	    --tokenizer tokenizer/py50k_bpe.model \
+	    --tokenizer tokenizer/spm.model \
 		$(ARGS)
 
 encode:
