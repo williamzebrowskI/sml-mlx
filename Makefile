@@ -4,17 +4,34 @@ PYTHON := python
 .PHONY: data tokenizer train eval clean
 
 data:
-	$(PYTHON) data/scripts/fetch_stack.py --output data/raw
-	$(PYTHON) data/scripts/clean_code.py --input data/raw --output data/clean_py.jsonl
+	python data/scripts/fetch_tinystories.py \
+		--output data/raw/tiny_stories.jsonl
+	python data/scripts/clean_code.py \
+		--input data/raw/tiny_stories.jsonl \
+		--output data/clean_text.jsonl
 
-tokenizer:
-	$(PYTHON) tokenizer/train_tokenizer.py --input data/clean_py.jsonl --model-dir tokenizer
-
+tokenizer:   ## trains tokenizer/py50k_bpe.{model,vocab}
+	$(PYTHON) tokenizer/train_tokenizer.py \
+	           --input data/clean_text.jsonl \
+	           --model-dir tokenizer \
+	           --model-type bpe \
+	           --vocab-size 50096 
 train:
-	$(PYTHON) model/train.py --config model/config.json --tokenizer tokenizer/py50k.model --dataset data/clean_py.jsonl --out model/checkpoints
+	PYTHONPATH=. \
+	$(PYTHON) -m model.train \
+	    --config model/config.json \
+	    --out model/checkpoints \
+	    --seq_len $(SEQ_LEN) \
+	    --batch_size $(BATCH_SIZE) \
+	    --total_steps $(TOTAL_STEPS)
 
 eval:
 	$(PYTHON) model/eval.py --checkpoint model/checkpoints/latest.safetensors --tokenizer tokenizer/py50k.model
+
+encode:
+	PYTHONPATH=. $(PYTHON) scripts/encode_jsonl.py \
+	           data/clean_text.jsonl tokenizer/py50k_bpe.model \
+	           > data/encoded.txt
 
 clean:
 	rm -rf model/checkpoints

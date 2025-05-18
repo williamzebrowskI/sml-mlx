@@ -1,15 +1,34 @@
-
-# Python
+# Byte-compiled / cache
 __pycache__/
 *.py[cod]
-*.pyd
-.venv/
-.venv*/
+.mypy_cache/
 
-# Mac
+# Virtual environments
+.venv/
+env/
+ENV/
+
+# Data artifacts
+data/raw/
+data/clean_text.jsonl
+data/encoded.txt
+data/encoded.bin
+
+# Tokenizer binaries
+tokenizer/*.model
+tokenizer/*.vocab
+
+# Model checkpoints
+model/checkpoints/
+
+# Logs / experiment tracking
+wandb/
+logs/
+
+# macOS
 .DS_Store
 
-# Data
-data/raw/
-data/clean_py.jsonl
-model/checkpoints/
+# Optional: Python package metadata
+*.egg-info/
+dist/
+build/
