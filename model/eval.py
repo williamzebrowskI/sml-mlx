@@ -27,7 +27,7 @@ def load_model(checkpoint_path: str, config_path: str) -> Transformer:
 
 def next_token_greedy(logits: mx.array) -> int:
     """Return argmax token (greedy decoding)."""
-    return int(mx.argmax(logits).item())  #  [oai_citation:0‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.array.logsumexp.html?utm_source=chatgpt.com)
+    return int(mx.argmax(logits).item())
 
 
 def run_mlx_sample(
@@ -45,7 +45,7 @@ def run_mlx_sample(
     seq_len: int = 512,
 ) -> str:
     # 1) PRNG key setup
-    key = mx.random.key(key_seed)  #  [oai_citation:1‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.key.html?utm_source=chatgpt.com)
+    key = mx.random.key(key_seed)
 
     # 2) Encode prompt → token IDs
     ids = tokenizer.encode(prompt)
@@ -85,13 +85,13 @@ def run_mlx_sample(
             scaled = logits / temperature
 
             # 9b) ascending sort → take last top_k indices
-            sorted_idx = mx.argsort(scaled)  #  [oai_citation:2‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.array.logsumexp.html?utm_source=chatgpt.com)
+            sorted_idx = mx.argsort(scaled)
             topk_idx = sorted_idx[-top_k:]
             topk_logits = scaled[topk_idx]
 
             # 9c) Sample
-            key, subkey = mx.random.split(key)  #  [oai_citation:3‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.split.html?utm_source=chatgpt.com)
-            rel = int(mx.random.categorical(topk_logits, key=subkey).item())  #  [oai_citation:4‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.categorical.html?utm_source=chatgpt.com)
+            key, subkey = mx.random.split(key)
+            rel = int(mx.random.categorical(topk_logits, key=subkey).item())
             next_id = int(topk_idx[rel].item())
 
         elif sampling_method == "top-p":
@@ -99,13 +99,13 @@ def run_mlx_sample(
             scaled = logits / temperature
 
             # 9b) Convert to probabilities via softmax: p = exp(scaled) / sum(exp(scaled))
-            lse = mx.logsumexp(scaled)  #  [oai_citation:5‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.logsumexp.html?utm_source=chatgpt.com)
-            probs = mx.exp(scaled - lse)  #  [oai_citation:6‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.exp.html?utm_source=chatgpt.com)
+            lse = mx.logsumexp(scaled)
+            probs = mx.exp(scaled - lse)
 
             # 9c) Sort ascending and compute cumulative sum
-            sorted_idx = mx.argsort(probs)  #  [oai_citation:7‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.array.logsumexp.html?utm_source=chatgpt.com)
+            sorted_idx = mx.argsort(probs)
             sorted_probs = probs[sorted_idx]
-            cum = mx.cumsum(sorted_probs)  #  [oai_citation:8‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.cumsum.html?utm_source=chatgpt.com)
+            cum = mx.cumsum(sorted_probs)
 
             # 9d) Determine cutoff where cumulative > top_p
             cutoff = int(mx.argmax(cum > top_p).item()) + 1
@@ -113,11 +113,11 @@ def run_mlx_sample(
             top_p_probs = probs[top_p_idx]
 
             # 9e) Renormalize
-            total = mx.sum(top_p_probs)  #  [oai_citation:9‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.array.html?utm_source=chatgpt.com)
+            total = mx.sum(top_p_probs)
             normed = top_p_probs / total
 
             # 9f) Sample
-            key, subkey = mx.random.split(key)  #  [oai_citation:10‡ML Explore](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.split.html?utm_source=chatgpt.com)
+            key, subkey = mx.random.split(key) 
             rel = int(mx.random.categorical(normed, key=subkey).item())
             next_id = int(top_p_idx[rel].item())
 

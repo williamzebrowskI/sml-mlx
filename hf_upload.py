@@ -3,7 +3,7 @@ from huggingface_hub import HfApi, HfFolder
 # 1) Authenticate
 token = HfFolder.get_token()
 api   = HfApi()
-repo_id = "wzebrowski/slm-mlx-100M-v3"
+repo_id = "wzebrowski/slm-mlx-v4-100m"
 
 # 2) Only the minimal files
 to_upload = [
