@@ -1,12 +1,12 @@
 
 PYTHON := python
+LATEST_CKPT := $(shell ls -1 model/checkpoints/ckpt_*.safetensors 2>/dev/null | sort | tail -n1)
 
 .PHONY: data tokenizer train eval clean
 
 data:
 	python data/scripts/fetch_wikitext.py \
 		--subset train \
-		--n_articles 50000 \
 		--output data/raw/wikitext_train.jsonl
 
 tokenizer:   ## trains tokenizer/py50k_bpe.{model,vocab}
@@ -40,6 +40,13 @@ encode:
 	PYTHONPATH=. $(PYTHON) scripts/encode_jsonl.py \
 	           data/clean_text.jsonl tokenizer/py50k_bpe.model \
 	           > data/encoded.txt
+
+test:   ## run eval_suite.py on the newest checkpoint
+	PYTHONPATH=. \
+	python scripts/eval_suite.py \
+	    --checkpoint $(LATEST_CKPT) \
+	    --config     model/config.json \
+	    --tokenizer  tokenizer/spm.model
 
 clean:
 	rm -rf model/checkpoints

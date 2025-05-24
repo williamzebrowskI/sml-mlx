@@ -1,11 +1,9 @@
 {
   "vocab_size": 50096,
   "n_layer": 18,
-  "hidden_size": 1024,
-  "intermediate_size": 4096,
-  "n_head": 16,
-  "rope_theta": 1000000,
-  "max_seq_len": 2048,
-  "rms_norm_eps": 1e-06,
-  "dtype": "bfloat16"
+  "hidden_size": 768,
+  "intermediate_size": 3072,
+  "n_head": 12,
+  "context_size": 512,
+  "rms_norm_eps": 1e-6
 }

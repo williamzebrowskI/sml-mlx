@@ -10,7 +10,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--subset",      default="train",
                    help="which split of wikitext-103-v1 to fetch")
-    p.add_argument("--n_articles",  type=int, default=50000,
+    p.add_argument("--n_articles",  type=int, default=100000000,
                    help="how many non-empty paragraphs to save")
     p.add_argument("--output",      required=True,
                    help="path to write JSONL (one {'text':…} per line)")
