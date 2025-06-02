@@ -1,13 +1,15 @@
 
 PYTHON := python
-LATEST_CKPT := $(shell ls -1 model/checkpoints/ckpt_*.safetensors 2>/dev/null | sort | tail -n1)
+LATEST_CKPT := $(shell ls -1 model/checkpoints_so/ckpt_121000.safetensors 2>/dev/null | sort | tail -n1)
 
 .PHONY: data tokenizer train eval clean
 
 data:
-	python data/scripts/fetch_wikitext.py \
-		--subset train \
-		--output data/raw/wikitext_train.jsonl
+	python data/scripts/fetch_openwebtext.py \
+		--dataset       Skylion007/openwebtext \
+		--split         train \
+		--token_budget  2000000000 \
+		--output        data/raw/openwebtext_2B.jsonl
 
 tokenizer:   ## trains tokenizer/py50k_bpe.{model,vocab}
 	python tokenizer/train_tokenizer.py \
