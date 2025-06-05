@@ -50,5 +50,12 @@ test:   ## run eval_suite.py on the newest checkpoint
 	    --config     model/config.json \
 	    --tokenizer  tokenizer/spm.model
 
+test_owt:
+	PYTHONPATH=. \
+	python scripts/eval_owt.py \
+		--checkpoint model/checkpoints_owt/ckpt_best.safetensors \
+		--config     model/config.json \
+		--tokenizer  tokenizer/spm.model
+
 clean:
 	rm -rf model/checkpoints

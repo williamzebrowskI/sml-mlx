@@ -21,6 +21,7 @@ tokenizer/*.vocab
 
 # Model checkpoints
 model/checkpoints/
+model/checkpoints_owt/
 
 # Logs / experiment tracking
 wandb/
