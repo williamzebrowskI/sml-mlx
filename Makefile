@@ -53,7 +53,7 @@ test:   ## run eval_suite.py on the newest checkpoint
 test_owt:
 	PYTHONPATH=. \
 	python scripts/eval_owt.py \
-		--checkpoint model/checkpoints_owt/ckpt_122000.safetensors \
+		--checkpoint model/checkpoints_owt/ckpt_best.safetensors \
 		--config     model/config.json \
 		--tokenizer  tokenizer/spm.model
 
