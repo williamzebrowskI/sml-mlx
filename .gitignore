@@ -11,6 +11,7 @@ ENV/
 
 # Data artifacts
 data/raw/
+data/fine_tune
 data/clean_text.jsonl
 data/encoded.txt
 data/encoded.bin
@@ -22,6 +23,7 @@ tokenizer/*.vocab
 # Model checkpoints
 model/checkpoints/
 model/checkpoints_owt/
+model/lora_adapters
 
 # Logs / experiment tracking
 wandb/
@@ -34,3 +36,4 @@ logs/
 *.egg-info/
 dist/
 build/
+

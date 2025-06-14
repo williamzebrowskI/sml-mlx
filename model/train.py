@@ -352,13 +352,14 @@ import json
 import math
 import pathlib
 import time
-from typing import Any
+from typing import Any, Iterator, List
 
 import datasets
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.nn.losses as losses
 import mlx.optimizers as optim
+import numpy as np
 from mlx.utils import tree_map  # canonical tree_map
 
 from tokenizer import sp_tokenizer
@@ -513,15 +514,8 @@ def main():
         print(f"[DEBUG] GPU Memory - Active: {active_mem:.1f} GB, Peak: {peak_mem:.1f} GB")
         # Set memory pool for better GPU utilization (90% of peak)
         mx.set_memory_limit(int(0.9 * mx.get_peak_memory()))
-    except:
-        # Use newer API if available
-        try:
-            active_mem = mx.get_active_memory() / 1024**3
-            peak_mem = mx.get_peak_memory() / 1024**3
-            print(f"[DEBUG] GPU Memory - Active: {active_mem:.1f} GB, Peak: {peak_mem:.1f} GB")
-            mx.set_memory_limit(int(0.9 * mx.get_peak_memory()))
-        except:
-            print("[DEBUG] Memory info not available")
+    except Exception:
+        print("[DEBUG] Memory info not available")
     print(f"[DEBUG] CLI args: {args}")
 
     # ── 1) Load SentencePiece tokenizer ──────────────────────────────────────
@@ -541,15 +535,26 @@ def main():
         print(f"[DEBUG] Tokenized {len(ds):,} paragraphs → {arrow_path}")
         ds.save_to_disk(str(arrow_path))
 
-    # ── 3) Flatten all token IDs into one mx.array ──────────────────────────
-    ids_list = []
-    for row in ds["ids"]:
-        ids_list.extend(row)
-    ids_arr = mx.array(ids_list, dtype=mx.int32)
+    # ── 3) Stream token IDs → single mx.array (memory-safe) ─────────────────
+    def stream_token_arrays(dataset, chunk_tokens: int = 8192 * 1024) -> Iterator[mx.array]:
+        """
+        Yield mx.arrays of ≤ chunk_tokens int32s so we never hold >~32 MB.
+        """
+        buf: List[int] = []
+        for ids in dataset["ids"]:
+            buf.extend(ids)
+            while len(buf) >= chunk_tokens:
+                chunk = np.array(buf[:chunk_tokens], dtype=np.int32)
+                yield mx.array(chunk)
+                del buf[:chunk_tokens]
+        if buf:
+            yield mx.array(np.array(buf, dtype=np.int32))
+
+    arrays = list(stream_token_arrays(ds))
+    ids_arr = mx.concatenate(arrays, axis=0)
     print(f"[DEBUG] Total tokens = {ids_arr.shape[0]:,}")
 
     # ── 4) Pack into samples of length context_size+1 ───────────────────────
-    #     Each row of 'samples' has shape (context_size+1,)
     context = args.context_size
     samples = to_samples(ids_arr, context)
     split_idx = int(samples.shape[0] * 0.95)
@@ -560,16 +565,12 @@ def main():
 
     # ── 5) Instantiate Transformer model ────────────────────────────────────
     cfg = TransformerConfig(**json.load(open(args.config)))
-    # Override context_size in the config to match our CLI
     cfg.context_size = context
     model = Transformer(cfg)
     
     # Count parameters
     def count_params(params):
-        total = 0
-        for param in _tree_iter(params):
-            total += param.size
-        return total
+        return sum(param.size for param in _tree_iter(params))
     
     total_params = count_params(model.parameters())
     print(f"[DEBUG] Model instantiated with {total_params:,} parameters")
@@ -582,11 +583,11 @@ def main():
         ck_name = pathlib.Path(args.resume).stem
         try:
             start_step = int(ck_name.split("_")[-1])
-        except:
+        except ValueError:
             print(f"[WARN] Could not parse step from {ck_name}, starting from 0")
         print(f"[DEBUG] Resumed from checkpoint at step {start_step}")
 
-    # ── 7) Prepare optimizer and gradient accumulation state ─────────────────
+    # ── 7) Prepare optimizer and gradient accumulation state ────────────────
     base_lr      = args.lr
     opt          = optim.AdamW(learning_rate=base_lr, weight_decay=0.1)
     accum_target = max(1, args.grad_accum)
@@ -600,9 +601,9 @@ def main():
 
     # ── 9) Define loss + gradient function ─────────────────────────────────
     def xent(mdl, batch: mx.array) -> mx.array:
-        x = batch[:, :-1]  # inputs, shape (B, L)
-        y = batch[:, 1:]   # targets, shape (B, L)
-        logits = mdl(x)    # (B, L, vocab_size)
+        x = batch[:, :-1]
+        y = batch[:, 1:]
+        logits = mdl(x)
         return losses.cross_entropy(
             logits.reshape(-1, cfg.vocab_size),
             y.reshape(-1)
@@ -619,7 +620,7 @@ def main():
     print("[DEBUG] Pre-compiling model...")
     dummy_batch = next(train_it)
     _ = value_and_grad(model, dummy_batch)
-    mx.eval(_)  # Force evaluation to compile
+    mx.eval(_)
     print("[DEBUG] Model pre-compilation complete")
 
     # ── 11) Training loop ─────────────────────────────────────────────────
@@ -632,8 +633,6 @@ def main():
         # (b) Fetch next micro‐batch, compute loss & grads
         batch = next(train_it)
         loss, grads = value_and_grad(model, batch)
-        
-        # Force evaluation to ensure computation completes
         mx.eval(loss, grads)
 
         # (c) Accumulate gradients
@@ -647,50 +646,36 @@ def main():
         if accum_count == accum_target:
             if args.grad_clip is not None:
                 g_accum = clip_by_global_norm(g_accum, args.grad_clip)
-            # average over micro‐batches
             g_accum = tree_map(lambda g: g / accum_target, g_accum)
             opt.update(model, g_accum)
-            mx.eval(model.parameters())  # Force parameter updates
+            mx.eval(model.parameters())
             g_accum, accum_count = None, 0
 
         buf.append(float(loss))
 
-        # ── (e) Reporting & validation ────────────────────────────────
+        # (e) Reporting & validation
         if step % args.steps_report == 0:
             t1 = time.perf_counter()
-            
-            # More efficient validation sampling
-            N_val = min(128, val_s.shape[0])  # Reduced from 256 for speed
+            N_val = min(128, val_s.shape[0])
             key = mx.random.key(step)
             idxs = mx.random.randint(0, val_s.shape[0], (N_val,), dtype=mx.int32, key=key)
-            
-            # Batch validation for efficiency
             val_batch = val_s[idxs]
             val_losses = []
-            batch_size_val = 8  # Process validation in small batches
+            batch_size_val = 8
             for i in range(0, N_val, batch_size_val):
-                end_idx = min(i + batch_size_val, N_val)
-                vb = val_batch[i:end_idx]
+                vb = val_batch[i:i + batch_size_val]
                 vl_batch = xent(model, vb)
                 mx.eval(vl_batch)
                 val_losses.append(float(vl_batch))
-            
             vl = sum(val_losses) / len(val_losses)
             ppl = math.exp(vl)
             tr_loss = sum(buf) / len(buf)
             elapsed = t1 - t0
-            
-            # Memory usage reporting
             try:
                 active_mem = mx.get_active_memory() / 1024**3
                 peak_mem = mx.get_peak_memory() / 1024**3
-            except:
-                try:
-                    active_mem = mx.get_active_memory() / 1024**3
-                    peak_mem = mx.get_peak_memory() / 1024**3
-                except:
-                    active_mem = peak_mem = 0
-            
+            except Exception:
+                active_mem = peak_mem = 0
             print(f"[{step:6d}/{args.total_steps}] "
                   f"loss={tr_loss:.3f}  it/s={args.steps_report/elapsed:.2f}  "
                   f"lr={opt.learning_rate:.2e}  "
@@ -716,13 +701,13 @@ def main():
                     print(f"[DEBUG] plateau@{step}: base_lr {old_lr:.2e} → {base_lr:.2e}")
                     no_imp = 0
 
-        # ── (f) Periodic checkpoint ────────────────────────────────────
+        # (f) Periodic checkpoint
         if step % args.steps_checkpoint == 0:
             ck = out_dir / f"ckpt_{step:06d}.safetensors"
             model.save_weights(str(ck))
             print(f"[DEBUG] Saved checkpoint → {ck.name}")
 
-    # ── 12) Final save ────────────────────────────────────────────────
+    # ── 12) Final save ────────────────────────────────────────────────────
     final_ck = out_dir / "ckpt_final.safetensors"
     model.save_weights(str(final_ck))
     print("✅ Training complete; final weights →", final_ck)

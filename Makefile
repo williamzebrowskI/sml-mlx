@@ -57,5 +57,13 @@ test_owt:
 		--config     model/config.json \
 		--tokenizer  tokenizer/spm.model
 
+tune:
+	python model/fine_tune_lora_mlx.py \
+		--checkpoint  model/checkpoints_owt/ckpt_best.safetensors \
+		--config      model/config.json \
+		--tokenizer   tokenizer/spm.model \
+		--train_jsonl data/qa_train.jsonl \
+		--valid_jsonl data/qa_valid.jsonl
+
 clean:
 	rm -rf model/checkpoints
