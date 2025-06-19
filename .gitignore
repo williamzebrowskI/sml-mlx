@@ -15,6 +15,7 @@ data/fine_tune
 data/clean_text.jsonl
 data/encoded.txt
 data/encoded.bin
+data/qa_prompt_completion
 
 # Tokenizer binaries
 tokenizer/*.model
@@ -24,6 +25,7 @@ tokenizer/*.vocab
 model/checkpoints/
 model/checkpoints_owt/
 model/lora_adapters
+runs/sml-lm/
 
 # Logs / experiment tracking
 wandb/
