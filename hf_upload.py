@@ -3,15 +3,15 @@ from huggingface_hub import HfApi, HfFolder
 # 1) Authenticate
 token = HfFolder.get_token()
 api   = HfApi()
-repo_id = "wzebrowski/slm-mlx-v5-100m"
+repo_id = "wzebrowski/mlx_slm_ft"
 
 # 2) Only the minimal files
 to_upload = [
-    ("model/checkpoints/ckpt_102000.safetensors",
-     "model/checkpoints/ckpt_102000.safetensors"),
-    ("model/config.json", "model/config.json"),
-    ("tokenizer/spm.model", "tokenizer/spm.model"),
-    ("tokenizer/spm.vocab", "tokenizer/spm.vocab"),
+    ("mlx_lora_peft/adapter_model.safetensors",
+     "adapter_model.safetensors"),
+    ("mlx_lora_peft/adapter_config.json", "adapter_config.json"),
+    ("tokenizer/spm.model", "spm.model"),
+    ("tokenizer/spm.vocab", "spm.vocab"),
 ]
 
 # 3) Push them
