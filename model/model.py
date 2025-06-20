@@ -217,6 +217,7 @@ class SMLMConfig:
     grad_clip        : float = 1.0
     eval_every       : int = 10_000
     torch_dtype      : str   = "bfloat16"
+    dropout          : float  = 0.0
 
     @classmethod
     def from_json(cls, path: str) -> "SMLMConfig":
@@ -242,6 +243,7 @@ class SMLMConfig:
             activation_fn_name        = raw["activation_fn_name"],
             initializer_range         = raw["initializer_range"],
             share_input_output_layers = raw["share_input_output_layers"],
+            dropout                   = raw["dropout"],
 
             # training args
             context_size      = raw["context_size"],
@@ -286,7 +288,7 @@ class FeedForward(nn.Module):
         self.act = acts[cfg.activation_fn_name]
 
         # Optional dropout for regularization
-        # self.dropout = nn.Dropout(cfg.dropout)  # <-- uncomment to use
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def __call__(self, x: mx.array) -> mx.array:
         y = self.proj_in(x)
@@ -295,7 +297,7 @@ class FeedForward(nn.Module):
             y = self.act(y1) * y2
         else:
             y = self.act(y)
-        # y = self.dropout(y)  # <-- uncomment to use
+        y = self.dropout(y) 
         return self.proj_out(y)
 
 # ───────────────────────────────────

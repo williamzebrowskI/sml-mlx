@@ -54,8 +54,8 @@ def generate(
     model,
     tok,
     prompt: str,
-    max_new: int = 20,
-    top_k:   int = 40,
+    max_new: int = 128,
+    top_k:   int = 5,
     temp:    float = 0.2,
 ) -> str:
     global _global_key

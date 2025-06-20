@@ -768,13 +768,13 @@ def main():
         acc_s += 1
 
         # train‐loss report
-        if step % 500 == 0:
+        if step % 100 == 0:
             print(f"[{step}/{cfg.max_iterations}] "
                   f"train_loss={acc_l/acc_s:.3f}  lr={opt.learning_rate:.2e}")
             acc_l = acc_s = 0
             t0    = time.time()
 
-        if step % 5000 == 0:
+        if step % 2500 == 0:
             ck = out_dir / f"ckpt_{step:07d}.safetensors"
             model.save_weights(str(ck))
             print("[info] checkpoint →", ck.name)
