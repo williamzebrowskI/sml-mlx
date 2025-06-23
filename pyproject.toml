@@ -10,5 +10,6 @@ dependencies = [
     "mlx>=0.25.2",
     "mlx-lm>=0.24.1",
     "rich>=14.0.0",
+    "tinygrad>=0.10.3",
     "wandb>=0.19.11",
 ]
