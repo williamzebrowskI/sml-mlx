@@ -19,7 +19,7 @@ data/qa_prompt_completion
 
 # Tokenizer binaries
 # tokenizer/*.model
-tokenizer/*.vocab
+# tokenizer/*.vocab
 
 # Model checkpoints
 model/checkpoints/
