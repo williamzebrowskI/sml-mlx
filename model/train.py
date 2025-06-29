@@ -308,7 +308,7 @@ def main():
 
     # ─── heterogeneous local batch sizes ───────────────────────
     LOCAL_BS = 16 if rank == 2 else cfg.train_batch_size
-    SCALE    = LOCAL_BS / cfg.train_batch_size           # 0.5 on the mini
+    SCALE    = LOCAL_BS / cfg.train_batch_size
 
     # dataset
     ds_path = pathlib.Path(args.dataset)
