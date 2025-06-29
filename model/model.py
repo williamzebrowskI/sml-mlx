@@ -208,7 +208,7 @@ class SMLMConfig:
 
     # training-only hyperparams (wired through train.py)
     context_size : int = 512
-    train_batch_size : int = 8
+    train_batch_size : int = 16
     max_iterations   : int = 350_000
     warmup_iterations: int = 5_000
     max_lr           : float = 5.3e-3

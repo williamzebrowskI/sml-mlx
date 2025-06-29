@@ -307,7 +307,7 @@ def main():
     pad_id = sp.piece_to_id("<pad>") if sp.piece_to_id("<pad>") >= 0 else -100
 
     # ─── heterogeneous local batch sizes ───────────────────────
-    LOCAL_BS = 8 if rank == 2 else cfg.train_batch_size
+    LOCAL_BS = 16 if rank == 2 else cfg.train_batch_size
     SCALE    = LOCAL_BS / cfg.train_batch_size           # 0.5 on the mini
 
     # dataset
