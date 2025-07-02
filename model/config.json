@@ -30,7 +30,7 @@
   "max_iterations": 350000,
   "warmup_iterations": 1000,
   "qkv_multipliers": [0.5, 1.0],
-  "max_lr": 0.00165,
+  "max_lr": 0.000825,
   "min_lr": 0.00033,
   "dropout": 0.0,
   "weight_decay": 0.01,
