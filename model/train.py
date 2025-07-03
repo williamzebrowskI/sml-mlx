@@ -416,11 +416,28 @@ def main():
         grads = clip_global(grads, cfg.grad_clip)
         opt.update(model, grads);  mx.eval(model.parameters())
 
-        acc_l += float(loss); acc_s += 1
-        if step % 10 == 0 and rank == 0:
-            print(f"[{step}/{cfg.max_iterations}] "
-                  f"loss={acc_l/acc_s:.3f} lr={opt.learning_rate:.2e} "
-                  f"(local_bs 16/16/8)", flush=True)
+        # accumulate local
+        local_loss = float(loss)
+        acc_l += local_loss
+        acc_s += 1
+
+        if step % 10 == 0:
+            # compute local average over last 10 iters
+            avg_local = acc_l / acc_s
+            # wrap to MX array for reduction
+            loss_arr = mx.array([avg_local], dtype=mx.float32)
+            # sum across all ranks
+            global_sum = mx.eval(mx.distributed.all_sum(loss_arr))
+            # average across world size
+            global_loss = float(global_sum) / size
+
+            if rank == 0:
+                print(f"[{step}/{cfg.max_iterations}] "
+                      f"global_loss={global_loss:.3f} lr={opt.learning_rate:.2e} "
+                      f"(batch_sizes {[LOCAL_BS for _ in range(size)]})",
+                      flush=True)
+
+            # reset accumulators
             acc_l = acc_s = 0
 
         # tiny val probe every 5 k steps
