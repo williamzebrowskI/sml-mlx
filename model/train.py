@@ -425,21 +425,19 @@ def main():
             # 1) local average over the last 10 iters
             avg_local = acc_l / acc_s
 
-            # 2) wrap in an MX array
+            # 2) wrap in an MLX array
             loss_arr = mx.array([avg_local], dtype=mx.float32)
 
-            # 3) all-reduce (sum) across ranks
+            # 3) all-reduce (sum) across ranks (returns an MLX array)
             summed = mx.distributed.all_sum(loss_arr)
 
-            # 4) force that computation
-            mx.eval(summed)
+            # 4) convert to a NumPy array on host
+            summed_np = np.asarray(summed)      # <-- no mx.eval here!
 
-            # 5) bring it back to host
-            np_summed = summed.asnumpy()
+            # 5) divide by world size for the true global average
+            global_loss = float(summed_np[0]) / size
 
-            # 6) compute the global average
-            global_loss = float(np_summed[0]) / size
-
+            # 6) only rank 0 prints
             if rank == 0:
                 print(
                     f"[{step}/{cfg.max_iterations}] "
@@ -449,7 +447,7 @@ def main():
                     flush=True,
                 )
 
-            # reset accumulators
+            # reset
             acc_l = acc_s = 0
 
         # tiny val probe every 5 k steps
