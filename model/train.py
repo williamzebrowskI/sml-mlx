@@ -422,22 +422,32 @@ def main():
         acc_s += 1
 
         if step % 10 == 0:
-            # compute local average over last 10 iters
+            # 1) local average over the last 10 iters
             avg_local = acc_l / acc_s
-            # wrap to MX array for reduction
+
+            # 2) wrap in an MX array
             loss_arr = mx.array([avg_local], dtype=mx.float32)
-            # sum across all ranks
-            global_sum = mx.eval(mx.distributed.all_sum(loss_arr))
-            # average across world size
-            global_loss = float(global_sum) / size
 
+            # 3) all-reduce (sum) across ranks
+            summed = mx.distributed.all_sum(loss_arr)
+
+            # 4) now evaluate that summed array
+            summed = mx.eval(summed)    # returns an MX array, not None
+
+            # 5) convert to a Python float and divide by world size
+            global_loss = float(summed[0]) / size
+
+            # 6) only rank 0 prints it
             if rank == 0:
-                print(f"[{step}/{cfg.max_iterations}] "
-                      f"global_loss={global_loss:.3f} lr={opt.learning_rate:.2e} "
-                      f"(batch_sizes {[LOCAL_BS for _ in range(size)]})",
-                      flush=True)
+                print(
+                    f"[{step}/{cfg.max_iterations}] "
+                    f"global_loss={global_loss:.3f} "
+                    f"lr={opt.learning_rate:.2e} "
+                    f"(batch_sizes={[LOCAL_BS]*size})",
+                    flush=True,
+                )
 
-            # reset accumulators
+            # reset
             acc_l = acc_s = 0
 
         # tiny val probe every 5 k steps
