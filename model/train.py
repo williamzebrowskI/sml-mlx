@@ -428,11 +428,17 @@ def main():
             # 2) wrap in an MX array
             loss_arr = mx.array([avg_local], dtype=mx.float32)
 
-            # 3) all-reduce + eval
-            summed_arr = mx.eval(mx.distributed.all_sum(loss_arr))
+            # 3) all-reduce (sum) across ranks
+            summed = mx.distributed.all_sum(loss_arr)
 
-            # 4) divide by world size
-            global_loss = float(summed_arr[0]) / size
+            # 4) force that computation
+            mx.eval(summed)
+
+            # 5) bring it back to host
+            np_summed = summed.asnumpy()
+
+            # 6) compute the global average
+            global_loss = float(np_summed[0]) / size
 
             if rank == 0:
                 print(
@@ -443,7 +449,7 @@ def main():
                     flush=True,
                 )
 
-            # reset
+            # reset accumulators
             acc_l = acc_s = 0
 
         # tiny val probe every 5 k steps
