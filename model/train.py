@@ -111,6 +111,10 @@ def main():
         _barrier()
         ds = load_from_disk(str(arrow_dir))
 
+    # shard and shuffle per rank
+    ds = ds.shard(num_shards=size, index=rank, contiguous=True)
+    ds = ds.shuffle(seed=42 + rank)
+
     train_it = sample_generator(ds, cfg.context_size, LOCAL_BS)
 
     # optional tiny validation set
@@ -118,6 +122,8 @@ def main():
     val_dir = ds_path.with_name("val.arrow")
     if val_dir.exists():
         val_ds = load_from_disk(str(val_dir))
+        val_ds = val_ds.shard(num_shards=size, index=rank, contiguous=True)
+        val_ds = val_ds.shuffle(seed=999 + rank)
         val_it = sample_generator(val_ds, cfg.context_size, LOCAL_BS)
 
     # model & optimizer
@@ -140,7 +146,7 @@ def main():
     _broadcast_params(model.parameters(), rank)
     print(f"[Rank {rank}] weights synced – entering loop (local_bs={LOCAL_BS})", flush=True)
 
-    # warm‐up length
+    # mini warm-up restart length
     RESTART_WARM = 1000
 
     # loss / grad fn
@@ -158,83 +164,48 @@ def main():
     value_and_grad = nn.value_and_grad(model, loss_fn)
     _ = value_and_grad(model, next(train_it)); mx.eval(_)
 
-    # ─────────────────── training loop with accumulation ────────────────────
+    # training loop
     out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     acc_l = acc_s = 0
+    for step in range(start_step + 1, cfg.max_iterations + 1):
 
-    ACCUM_STEPS = 4
-    accum_grads: Any = None
-    micro_step = 0
-    global_step = start_step
-
-    for _ in range(start_step + 1, cfg.max_iterations + 1):
-        global_step += 1
-
-        # LR schedule on global step
-        if global_step < start_step + RESTART_WARM:
-            opt.learning_rate = cfg.max_lr * (global_step - start_step) / RESTART_WARM
+        # LR schedule
+        if step < start_step + RESTART_WARM:
+            opt.learning_rate = cfg.max_lr * (step - start_step) / RESTART_WARM
         else:
             opt.learning_rate = cosine_lr(
-                global_step,
+                step,
                 base   = cfg.max_lr,
                 warmup = cfg.warmup_iterations,
                 total  = cfg.max_iterations,
                 min_lr = cfg.min_lr,
             )
 
-        # forward + grad
-        loss, grads = value_and_grad(model, next(train_it))
-        mx.eval(loss, grads)
+        loss, grads = value_and_grad(model, next(train_it)); mx.eval(loss, grads)
+        if SCALE != 1.0:  # scale for heterogeneous BS
+            grads = tree_map(lambda g: g * SCALE if isinstance(g, mx.array) else g, grads)
+        grads = clip_global(grads, cfg.grad_clip)
+        opt.update(model, grads); mx.eval(model.parameters())
 
-        # scale for accumulation
-        grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
+        acc_l += float(loss); acc_s += 1
+        if step % 10 == 0 and rank == 0:
+            print(f"[{step}/{cfg.max_iterations}] loss={acc_l/acc_s:.3f} lr={opt.learning_rate:.2e}",
+                  flush=True)
+            acc_l = acc_s = 0
 
-        # accumulate
-        if accum_grads is None:
-            accum_grads = grads
-        else:
-            accum_grads = tree_map(
-                lambda a, g: a + g if isinstance(a, mx.array) else a,
-                accum_grads, grads
-            )
-        micro_step += 1
-
-        # when micro‐batches reach ACCUM_STEPS, do an update
-        if micro_step == ACCUM_STEPS:
-            # clip + apply accumulated grads
-            clipped = clip_global(accum_grads, cfg.grad_clip)
-            opt.update(model, clipped)
-            mx.eval(model.parameters())
-
-            # reset
-            accum_grads = None
-            micro_step = 0
-
-            # track & print loss on global step (rank 0 only)
-            local_loss = float(loss)
-            acc_l += local_loss
-            acc_s += 1
-
-            if global_step % 10 == 0 and rank == 0:
-                avg = acc_l / acc_s
-                print(f"[{global_step}/{cfg.max_iterations}] "
-                      f"loss={avg:.3f} lr={opt.learning_rate:.2e}", flush=True)
-                acc_l = acc_s = 0
-
-        # occasional validation probe
-        if val_it and global_step % 5000 == 0 and rank == 0:
+        # validation
+        if val_it and step % 5000 == 0 and rank == 0:
             vloss = 0.0
             for _ in range(100):
                 vloss += float(loss_fn(model, next(val_it)))
-            print(f"[val] step {global_step}: {vloss/100:.3f}", flush=True)
+            print(f"[val] step {step}: {vloss/100:.3f}", flush=True)
 
-        # checkpointing
-        if global_step % 2500 == 0 and rank == 0:
-            ck = out_dir / f"ckpt_{global_step:07d}.safetensors"
+        # checkpoint
+        if step % 2500 == 0 and rank == 0:
+            ck = out_dir / f"ckpt_{step:07d}.safetensors"
             model.save_weights(str(ck))
             print(f"[Rank 0] checkpoint → {ck.name}", flush=True)
 
-    # final save
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
         print("✅ Training complete", flush=True)
