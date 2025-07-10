@@ -299,6 +299,7 @@ def main():
     group = mx.distributed.init()
     rank, size = group.rank(), group.size()
     print(f"[Rank {rank}] launcher OK ({rank+1}/{size})", flush=True)
+
     args = get_args()
     mx.set_default_device(mx.gpu if args.device=="gpu" else mx.cpu)
 
@@ -307,22 +308,30 @@ def main():
     sp  = spm.SentencePieceProcessor(model_file=args.tokenizer)
     pad_id = sp.piece_to_id("<pad>") if sp.piece_to_id("<pad>")>=0 else -100
 
-    # ── local batch size ─────────────────────────────
-    LOCAL_BS = cfg.train_batch_size
-
     # ── streaming load + shard + shuffle ─────────────
+    print(f"[Rank {rank}] about to load_dataset('{args.dataset}', streaming=True)", flush=True)
     ds = load_dataset(
         args.dataset,
         args.dataset_config,
         split="train",
         streaming=True
     )
-    ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-    ds = ds.shard(num_shards=size, index=rank, contiguous=True)
-    ds = ds.shuffle(seed=42 + rank)
-    print(f"[Rank {rank}] dataset stream ready, entering iterator...", flush=True)
+    print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
 
-    train_it = sample_generator(ds, cfg.context_size, LOCAL_BS)
+    print(f"[Rank {rank}] about to map→encode_sp", flush=True)
+    ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
+    print(f"[Rank {rank}] ✔ map complete", flush=True)
+
+    print(f"[Rank {rank}] about to shard (shard={rank}/{size})", flush=True)
+    ds = ds.shard(num_shards=size, index=rank, contiguous=True)
+    print(f"[Rank {rank}] ✔ shard complete", flush=True)
+
+    print(f"[Rank {rank}] about to shuffle(buffer_size=1000, seed={42+rank})", flush=True)
+    ds = ds.shuffle(buffer_size=1000, seed=42 + rank)
+    print(f"[Rank {rank}] ✔ shuffle complete", flush=True)
+
+    train_it = sample_generator(ds, cfg.context_size, cfg.train_batch_size)
+    print(f"[Rank {rank}] dataset stream ready, entering iterator...", flush=True)
 
     # ── optional streaming validation ────────────────
     val_it = None
@@ -335,8 +344,8 @@ def main():
         )
         val_ds = val_ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
         val_ds = val_ds.shard(num_shards=size, index=rank, contiguous=True)
-        val_ds = val_ds.shuffle(seed=999 + rank)
-        val_it = sample_generator(val_ds, cfg.context_size, LOCAL_BS)
+        val_ds = val_ds.shuffle(buffer_size=1000, seed=999 + rank)
+        val_it = sample_generator(val_ds, cfg.context_size, cfg.train_batch_size)
     except Exception:
         pass
 
@@ -352,9 +361,11 @@ def main():
     if args.resume and rank==0:
         model.load_weights(args.resume)
         start_step = int(pathlib.Path(args.resume).stem.split("_")[-1])
-        print(f"[Rank 0] resumed from {args.resume} (step {start_step})", flush=True)
-    _ = mx.eval(mx.distributed.all_sum(mx.array([1],dtype=mx.int32)))
-    for p in model.parameters(): mx.distributed.all_sum(p)
+        print(f"[Rank 0] resumed from {args.resume}", flush=True)
+
+    mx.eval(mx.distributed.all_sum(mx.array([1], dtype=mx.int32)))
+    for p in model.parameters():
+        mx.distributed.all_sum(p)
 
     # ── loss fn & grad setup ─────────────────────────
     def loss_fn(m, batch):
@@ -371,9 +382,10 @@ def main():
     value_and_grad = nn.value_and_grad(model, loss_fn)
     _ = value_and_grad(model, next(train_it)); mx.eval(_)
 
-    # ── training loop with verbose logging ───────────
+    # ── training loop ────────────────────────────────
     out_dir = pathlib.Path(args.out); out_dir.mkdir(exist_ok=True, parents=True)
     acc_l = acc_s = 0
+
     for step in range(start_step+1, cfg.max_iterations+1):
         # LR schedule
         if step < cfg.warmup_iterations:
@@ -392,17 +404,29 @@ def main():
         grads = clip_global(grads, cfg.grad_clip)
         opt.update(model, grads); mx.eval(model.parameters())
 
-        # logging on every step for sanity check
+        # logging on rank 0
         acc_l += float(loss); acc_s += 1
-        if step % 1 == 0 and rank==0:
-            print(f"[{step}/{cfg.max_iterations}] loss={acc_l/acc_s:.3f} lr={opt.learning_rate:.2e}", flush=True)
+        if step % 10 == 0 and rank==0:
+            print(f"[{step}/{cfg.max_iterations}] "
+                  f"loss={acc_l/acc_s:.3f} "
+                  f"lr={opt.learning_rate:.2e}", flush=True)
             acc_l = acc_s = 0
 
-        # val & checkpoint omitted for brevity
+        # val & checkpoint
+        if val_it and step%5000==0 and rank==0:
+            vloss=0.0
+            for _ in range(100):
+                vloss += float(loss_fn(model, next(val_it)))
+            print(f"[val] step {step}: {vloss/100:.3f}", flush=True)
+        if step%2500==0 and rank==0:
+            ck = out_dir/f"ckpt_{step:07d}.safetensors"
+            model.save_weights(str(ck))
+            print(f"[Rank 0] checkpoint → {ck.name}", flush=True)
 
     if rank==0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
         print("✅ Training complete", flush=True)
+
 
 if __name__ == "__main__":
     main()
