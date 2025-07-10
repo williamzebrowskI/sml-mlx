@@ -225,7 +225,9 @@
 # if __name__ == "__main__":
 #     main()
 
+#!/usr/bin/env python3
 # model/train.py
+
 from __future__ import annotations
 import argparse, pathlib, math, json, time
 from typing import Iterator, Dict, Any
@@ -285,7 +287,7 @@ def get_args():
     p.add_argument("--config",    required=True, help="model/config.json")
     p.add_argument("--tokenizer", required=True, help="path/to/spm.model")
     p.add_argument("--dataset",   required=True,
-                   help="HF dataset id (e.g. 'allenai/c4') – streaming will be used")
+                   help="HF dataset id (e.g. 'allenai/c4') – streaming")
     p.add_argument("--dataset-config", default=None,
                    help="optional config name (e.g. 'en' for C4)")
     p.add_argument("--out",       required=True, help="output dir for checkpoints")
@@ -309,29 +311,29 @@ def main():
     pad_id = sp.piece_to_id("<pad>") if sp.piece_to_id("<pad>")>=0 else -100
 
     # ── streaming load + shard + shuffle ─────────────
-    print(f"[Rank {rank}] about to load_dataset('{args.dataset}', streaming=True)", flush=True)
+    print(f"[Rank {rank}] about to load_dataset('{args.dataset}', streaming=True)")
     ds = load_dataset(
         args.dataset,
         args.dataset_config,
         split="train",
         streaming=True
     )
-    print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
+    print(f"[Rank {rank}] ✔ load_dataset complete")
 
-    print(f"[Rank {rank}] about to map→encode_sp", flush=True)
+    print(f"[Rank {rank}] about to map→encode_sp")
     ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-    print(f"[Rank {rank}] ✔ map complete", flush=True)
+    print(f"[Rank {rank}] ✔ map complete")
 
-    print(f"[Rank {rank}] about to shard (shard={rank}/{size})", flush=True)
+    print(f"[Rank {rank}] about to shard (shard={rank}/{size})")
     ds = ds.shard(num_shards=size, index=rank, contiguous=True)
-    print(f"[Rank {rank}] ✔ shard complete", flush=True)
+    print(f"[Rank {rank}] ✔ shard complete")
 
-    print(f"[Rank {rank}] about to shuffle(buffer_size=1000, seed={42+rank})", flush=True)
-    ds = ds.shuffle(buffer_size=1000, seed=42 + rank)
-    print(f"[Rank {rank}] ✔ shuffle complete", flush=True)
+    print(f"[Rank {rank}] about to shuffle(seed={42+rank})")
+    ds = ds.shuffle(seed=42 + rank)
+    print(f"[Rank {rank}] ✔ shuffle complete")
 
+    print(f"[Rank {rank}] dataset stream ready, entering iterator…")
     train_it = sample_generator(ds, cfg.context_size, cfg.train_batch_size)
-    print(f"[Rank {rank}] dataset stream ready, entering iterator...", flush=True)
 
     # ── optional streaming validation ────────────────
     val_it = None
@@ -344,7 +346,7 @@ def main():
         )
         val_ds = val_ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
         val_ds = val_ds.shard(num_shards=size, index=rank, contiguous=True)
-        val_ds = val_ds.shuffle(buffer_size=1000, seed=999 + rank)
+        val_ds = val_ds.shuffle(seed=999 + rank)
         val_it = sample_generator(val_ds, cfg.context_size, cfg.train_batch_size)
     except Exception:
         pass
@@ -363,9 +365,10 @@ def main():
         start_step = int(pathlib.Path(args.resume).stem.split("_")[-1])
         print(f"[Rank 0] resumed from {args.resume}", flush=True)
 
-    mx.eval(mx.distributed.all_sum(mx.array([1], dtype=mx.int32)))
+    # barrier & broadcast initial weights
+    _ = mx.eval(mx.distributed.all_sum(mx.array([1], dtype=mx.int32)))
     for p in model.parameters():
-        mx.distributed.all_sum(p)
+        mx.eval(mx.distributed.all_sum(p))
 
     # ── loss fn & grad setup ─────────────────────────
     def loss_fn(m, batch):
@@ -385,7 +388,6 @@ def main():
     # ── training loop ────────────────────────────────
     out_dir = pathlib.Path(args.out); out_dir.mkdir(exist_ok=True, parents=True)
     acc_l = acc_s = 0
-
     for step in range(start_step+1, cfg.max_iterations+1):
         # LR schedule
         if step < cfg.warmup_iterations:
@@ -414,14 +416,14 @@ def main():
 
         # val & checkpoint
         if val_it and step%5000==0 and rank==0:
-            vloss=0.0
+            vloss=0
             for _ in range(100):
-                vloss += float(loss_fn(model, next(val_it)))
-            print(f"[val] step {step}: {vloss/100:.3f}", flush=True)
+                vloss+=float(loss_fn(model,next(val_it)))
+            print(f"[val] step {step}: {vloss/100:.3f}",flush=True)
         if step%2500==0 and rank==0:
             ck = out_dir/f"ckpt_{step:07d}.safetensors"
             model.save_weights(str(ck))
-            print(f"[Rank 0] checkpoint → {ck.name}", flush=True)
+            print(f"[Rank 0] checkpoint → {ck.name}",flush=True)
 
     if rank==0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
