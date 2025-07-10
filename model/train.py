@@ -242,6 +242,9 @@ import numpy as np
 
 from model.model import OpenELM, SMLMConfig
 
+# 🔥 Banner to confirm updated script on every rank
+print("🔥 hello from updated trainer 🔥", flush=True)
+
 
 # ───────────────────────── barrier & broadcast helpers ─────────
 def _barrier() -> None:
