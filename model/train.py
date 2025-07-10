@@ -289,12 +289,16 @@ def clip_global(tree, max_norm):
 
 def get_args():
     p = argparse.ArgumentParser("OpenELM MLX trainer")
-    p.add_argument("--config",     required=True)
-    p.add_argument("--tokenizer",  required=True)
-    p.add_argument("--dataset",    required=True, help="HF dataset id (streaming)")
-    p.add_argument("--dataset-config", default=None, help="HF dataset config name")
-    p.add_argument("--out",        required=True)
-    p.add_argument("--device",     choices=["cpu", "gpu"], default="gpu")
+    p.add_argument("--config",           required=True)
+    p.add_argument("--tokenizer",        required=True)
+    p.add_argument("--dataset",          required=True,
+                   help="HF dataset id (streaming)")
+    p.add_argument("--dataset-config",   default=None,
+                   help="HF dataset config name")
+    p.add_argument("--train-split",      default="train",
+                   help="which split (or slice) to use, e.g. 'train', 'train[:1%]'")
+    p.add_argument("--out",              required=True)
+    p.add_argument("--device",           choices=["cpu", "gpu"], default="gpu")
     p.add_argument("--resume")
     return p.parse_args()
 
@@ -306,7 +310,7 @@ def main():
     print(f"[Rank {rank}] launcher OK ({rank+1}/{size})", flush=True)
 
     args = get_args()
-    mx.set_default_device(mx.gpu if args.device=="gpu" else mx.cpu)
+    mx.set_default_device(mx.gpu if args.device == "gpu" else mx.cpu)
 
     # config & tokenizer
     cfg = SMLMConfig.from_json(args.config)
@@ -321,11 +325,11 @@ def main():
     SCALE = LOCAL_BS / cfg.train_batch_size
 
     # ─── streaming dataset load & preprocess ────────────────────
-    print(f"[Rank {rank}] about to load_dataset('{args.dataset}', streaming=True)", flush=True)
+    print(f"[Rank {rank}] about to load_dataset('{args.dataset}', split='{args.train_split}')", flush=True)
     ds = load_dataset(
         args.dataset,
         args.dataset_config,
-        split="train",
+        split=args.train_split,
         streaming=True,
         trust_remote_code=True,
     )
@@ -378,10 +382,10 @@ def main():
     except Exception:
         pass
 
-
     # model & optimizer
     model = OpenELM(cfg)
-    opt   = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8, weight_decay=cfg.weight_decay)
+    opt   = optim.AdamW(cfg.max_lr, betas=(0.9, .98),
+                        eps=1e-8, weight_decay=cfg.weight_decay)
     if cfg.torch_dtype == "bfloat16" and hasattr(mx, "set_default_dtype"):
         mx.set_default_dtype(mx.bfloat16)
 
