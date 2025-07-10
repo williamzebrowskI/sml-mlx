@@ -242,6 +242,9 @@ import numpy as np
 
 from model.model import OpenELM, SMLMConfig
 
+from datasets import DownloadConfig
+download_config = DownloadConfig(timeout=60, max_retries=5)
+
 # 🔥 Banner to confirm updated script on every rank
 print("🔥 hello from updated trainer 🔥", flush=True)
 
@@ -335,6 +338,7 @@ def main():
         split=args.train_split,
         streaming=True,
         trust_remote_code=True,
+        download_config=download_config,
     )
     print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
 
@@ -364,6 +368,7 @@ def main():
             split="validation",
             streaming=True,
             trust_remote_code=True,
+            download_config=download_config,
         )
         print(f"[Rank {rank}] ✔ validation load complete", flush=True)
 
