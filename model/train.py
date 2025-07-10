@@ -326,7 +326,8 @@ def main():
         args.dataset,
         args.dataset_config,
         split="train",
-        streaming=True
+        streaming=True,
+        trust_remote_code=True,
     )
     print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
 
@@ -354,7 +355,8 @@ def main():
             args.dataset,
             args.dataset_config,
             split="validation",
-            streaming=True
+            streaming=True,
+            trust_remote_code=True,
         )
         print(f"[Rank {rank}] ✔ validation load complete", flush=True)
 
