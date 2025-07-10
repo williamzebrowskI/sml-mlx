@@ -270,7 +270,7 @@ def sample_generator(dataset: Iterator[Dict[str, Any]], ctx: int, bs: int) -> It
                 chunk = np.asarray(buf[: window * bs], dtype=np.int32)
                 del buf[: window * bs]
                 yield mx.array(chunk).reshape(bs, window)
-        # streaming never exhausts – it just continues
+        # streaming never exhausts
 
 
 def cosine_lr(step, *, base, warmup, total, min_lr):
@@ -291,8 +291,8 @@ def get_args():
     p = argparse.ArgumentParser("OpenELM MLX trainer")
     p.add_argument("--config",     required=True)
     p.add_argument("--tokenizer",  required=True)
-    p.add_argument("--dataset",    required=True, help="HF dataset id (streaming enabled)")
-    p.add_argument("--dataset-config", default=None, help="HF dataset config name, if any")
+    p.add_argument("--dataset",    required=True, help="HF dataset id (streaming)")
+    p.add_argument("--dataset-config", default=None, help="HF dataset config name")
     p.add_argument("--out",        required=True)
     p.add_argument("--device",     choices=["cpu", "gpu"], default="gpu")
     p.add_argument("--resume")
@@ -321,33 +321,61 @@ def main():
     SCALE = LOCAL_BS / cfg.train_batch_size
 
     # ─── streaming dataset load & preprocess ────────────────────
+    print(f"[Rank {rank}] about to load_dataset('{args.dataset}', streaming=True)", flush=True)
     ds = load_dataset(
         args.dataset,
         args.dataset_config,
         split="train",
         streaming=True
     )
-    ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-    ds = ds.shard(num_shards=size, index=rank, contiguous=True)
-    ds = ds.shuffle(seed=42 + rank)
+    print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
 
+    print(f"[Rank {rank}] about to map→encode_sp", flush=True)
+    ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
+    print(f"[Rank {rank}] ✔ map complete", flush=True)
+
+    print(f"[Rank {rank}] about to shard (shard={rank}/{size})", flush=True)
+    ds = ds.shard(num_shards=size, index=rank, contiguous=True)
+    print(f"[Rank {rank}] ✔ shard complete", flush=True)
+
+    seed = 42 + rank
+    print(f"[Rank {rank}] about to shuffle(seed={seed})", flush=True)
+    ds = ds.shuffle(seed=seed)
+    print(f"[Rank {rank}] ✔ shuffle complete", flush=True)
+
+    print(f"[Rank {rank}] dataset stream ready, entering iterator...", flush=True)
     train_it = sample_generator(ds, cfg.context_size, LOCAL_BS)
 
     # optional streaming validation
     val_it = None
     try:
+        print(f"[Rank {rank}] about to load validation split", flush=True)
         val_ds = load_dataset(
             args.dataset,
             args.dataset_config,
             split="validation",
             streaming=True
         )
+        print(f"[Rank {rank}] ✔ validation load complete", flush=True)
+
+        print(f"[Rank {rank}] about to map→encode_sp on validation", flush=True)
         val_ds = val_ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
+        print(f"[Rank {rank}] ✔ validation map complete", flush=True)
+
+        print(f"[Rank {rank}] about to shard validation (shard={rank}/{size})", flush=True)
         val_ds = val_ds.shard(num_shards=size, index=rank, contiguous=True)
-        val_ds = val_ds.shuffle(seed=999 + rank)
+        print(f"[Rank {rank}] ✔ validation shard complete", flush=True)
+
+        vseed = 999 + rank
+        print(f"[Rank {rank}] about to shuffle validation(seed={vseed})", flush=True)
+        val_ds = val_ds.shuffle(seed=vseed)
+        print(f"[Rank {rank}] ✔ validation shuffle complete", flush=True)
+
+        print(f"[Rank {rank}] validation stream ready, entering iterator...", flush=True)
         val_it = sample_generator(val_ds, cfg.context_size, LOCAL_BS)
     except Exception:
         pass
+
 
     # model & optimizer
     model = OpenELM(cfg)
