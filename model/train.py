@@ -345,8 +345,8 @@ def main():
                 args.dataset_config,
                 split=args.train_split,
                 streaming=True,
-                trust_remote_code=True,
                 download_config=download_config,
+                trust_remote_code=True
             )
             print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
             break
