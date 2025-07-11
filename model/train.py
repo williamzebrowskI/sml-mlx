@@ -457,6 +457,11 @@ def main():
             accum_grads = None
             micro_step  = 0
 
+            if rank == 0 and global_step % 5000 == 0 and global_step != 0:
+                ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
+                model.save_weights(str(ckpt_path))
+                print(f"[{global_step}] ✔ saved {ckpt_path.name}", flush=True)
+
             local_loss = float(loss)
             acc_l += local_loss; acc_s += 1
             if global_step % 10 == 0 and rank == 0:
