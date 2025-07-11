@@ -225,9 +225,9 @@
 # if __name__ == "__main__":
 #     main()
 
-# model/train.py  –  full file with minimal necessary changes
+# model/train.py
 from __future__ import annotations
-import argparse, pathlib, math, json, time
+import argparse, pathlib, math, json, time, itertools   # ← ADDED itertools
 from typing import Iterator, Dict, Any
 
 import mlx.core as mx
@@ -306,8 +306,7 @@ def get_args():
     return p.parse_args()
 
 
-# configure retryable downloads
-download_config = DownloadConfig(max_retries=5)
+download_config = DownloadConfig(max_retries=5)   # retryable downloads
 
 
 # ─────────────────────────── main ──────────────────────────────
@@ -324,11 +323,11 @@ def main():
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
     pad_id = sp.piece_to_id("<pad>") if sp.piece_to_id("<pad>") >= 0 else -100
 
-    # ─── per-GPU micro-batch; keep global batch via accumulation ───
-    LOCAL_BS    = 4        # smaller micro-batch
-    ACCUM_STEPS = 16       # 4 × 16 = original global batch 64
+    # per-GPU micro-batch; keep global batch via accumulation
+    LOCAL_BS    = 4
+    ACCUM_STEPS = 16
 
-    # ─── streaming dataset load & preprocess ────────────────────
+    # streaming dataset load & preprocess
     for attempt in range(1, 6):
         try:
             print(f"[Rank {rank}] load_dataset try {attempt}/5 …", flush=True)
@@ -351,9 +350,25 @@ def main():
     ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
     ds = ds.shard(num_shards=size, index=rank, contiguous=True)
     ds = ds.shuffle(seed=42 + rank)
-    train_it = sample_generator(ds, cfg.context_size, LOCAL_BS)
 
-    # optional validation
+    # ─── offset handling ────────────────────────────────────────
+    out_dir = pathlib.Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    offset_file = out_dir / "offset.txt"
+    offset = int(offset_file.read_text()) if offset_file.exists() else 0
+    print(f"[Rank {rank}] skipping first {offset:,} tokens")
+
+    skip_batches = offset // (LOCAL_BS * (cfg.context_size + 1))
+    train_it = itertools.islice(
+        sample_generator(ds, cfg.context_size, LOCAL_BS),
+        skip_batches,
+        None
+    )
+    processed = offset  # running token counter
+    # ────────────────────────────────────────────────────────────
+
+    # optional validation iterator (unchanged) …
     val_it = None
     try:
         val_ds = load_dataset(
@@ -413,7 +428,6 @@ def main():
     mx.eval(_)
 
     # training loop with grad accumulation
-    out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     acc_l = acc_s = 0
     accum_grads: Any = None
     micro_step = 0
@@ -456,35 +470,37 @@ def main():
             accum_grads = None
             micro_step  = 0
 
-            # ───────────────────────── checkpoint + quick probe ─────────────────────────
+            # ─── checkpoint, probe, and offset persist ───────────
             if rank == 0 and global_step % 5000 == 0 and global_step != 0:
                 ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
                 model.save_weights(str(ckpt_path))
                 print(f"[{global_step}] ✔ saved {ckpt_path.name}", flush=True)
 
-                # one-line coherency sample (top-k / temperature sampling, 20 tokens)
-                model.eval()                               # inference mode
+                # persist processed token count
+                processed += LOCAL_BS * cfg.context_size * ACCUM_STEPS
+                offset_file.write_text(str(processed))
+                print(f"[{global_step}] ✔ wrote offset.txt ({processed:,} tokens)", flush=True)
+
+                # quick text probe …
+                model.eval()
                 prompt = "The quick brown fox"
                 ids    = sp.encode(prompt, out_type=int)
                 x      = mx.array(ids, dtype=mx.int32)[None, :]
                 top_k, temp = 40, 0.7
-
-                for _ in range(20):                        # generate 20 new tokens
+                for _ in range(20):
                     logits = model(x)[0, -1] / max(temp, 1e-6)
                     if 0 < top_k < logits.size:
                         kth = mx.topk(logits, k=top_k)[-1]
                         logits = mx.where(logits < kth, -mx.inf, logits)
                     probs = nn.softmax(logits, axis=-1)
                     nxt   = int(mx.random.categorical(probs))
-                    x     = mx.concatenate([x,
-                            mx.array([[nxt]], dtype=mx.int32)], axis=1)
+                    x     = mx.concatenate([x, mx.array([[nxt]], dtype=mx.int32)], axis=1)
                     if nxt == sp.eos_id():
                         break
-
                 sample = sp.decode(list(x[0, len(ids):].tolist()))
-                model.train()                              # back to training
+                model.train()
                 print(f"[{global_step}] ▶ \"{prompt} …{sample}\"", flush=True)
-            # ────────────────────────────────────────────────────────────────────────────
+            # ─────────────────────────────────────────────────────
 
             local_loss = float(loss)
             acc_l += local_loss; acc_s += 1
@@ -499,17 +515,16 @@ def main():
 
         # optional validation
         if val_it is not None and global_step % cfg.eval_every == 0 and micro_step == 0:
-            model.eval()  # inference mode
-            v_loss = np.mean([
-                float(loss_fn(model, next(val_it)))
-                for _ in range(4)
-            ])
-            model.train()  # back to training mode
+            model.eval()
+            v_loss = np.mean([float(loss_fn(model, next(val_it))) for _ in range(4)])
+            model.train()
             if rank == 0:
                 print(f"[{global_step}]  ★ val_loss={v_loss:.3f}", flush=True)
 
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
+        processed += LOCAL_BS * cfg.context_size * ACCUM_STEPS  # final batch
+        offset_file.write_text(str(processed))
         print("✅ Training complete", flush=True)
 
 
