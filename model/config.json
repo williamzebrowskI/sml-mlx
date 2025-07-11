@@ -27,7 +27,7 @@
   "share_input_output_layers":true,
   "context_size":512,
   "train_batch_size":16,
-  "max_iterations":350000,
+  "max_iterations":1000000,
   "warmup_iterations":300,
   "qkv_multipliers":[0.5,1.0],
   "max_lr":0.0000515625,
