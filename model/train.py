@@ -456,7 +456,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     acc_l = acc_s = 0
 
-    ACCUM_STEPS = 8  # ramped up from 4 to 8 micro-batches per update
+    ACCUM_STEPS = 4  # ramped up from 4 to 8 micro-batches per update
     accum_grads: Any = None
     micro_step = 0
 
