@@ -225,13 +225,9 @@
 # if __name__ == "__main__":
 #     main()
 
-# model/train.py
+# model/train.py  –  full file with minimal necessary changes
 from __future__ import annotations
-import argparse
-import pathlib
-import math
-import json
-import time
+import argparse, pathlib, math, json, time
 from typing import Iterator, Dict, Any
 
 import mlx.core as mx
@@ -276,7 +272,6 @@ def sample_generator(dataset: Iterator[Dict[str, Any]], ctx: int, bs: int) -> It
                 chunk = np.asarray(buf[: window * bs], dtype=np.int32)
                 del buf[: window * bs]
                 yield mx.array(chunk).reshape(bs, window)
-        # streaming never exhausts
 
 
 def cosine_lr(step, *, base, warmup, total, min_lr):
@@ -297,16 +292,16 @@ def clip_global(tree, max_norm):
 
 def get_args():
     p = argparse.ArgumentParser("OpenELM MLX trainer")
-    p.add_argument("--config",           required=True)
-    p.add_argument("--tokenizer",        required=True)
-    p.add_argument("--dataset",          required=True,
+    p.add_argument("--config",         required=True)
+    p.add_argument("--tokenizer",      required=True)
+    p.add_argument("--dataset",        required=True,
                    help="HF dataset id (streaming)")
-    p.add_argument("--dataset-config",   default=None,
+    p.add_argument("--dataset-config", default=None,
                    help="HF dataset config name")
-    p.add_argument("--train-split",      default="train",
-                   help="which split (or slice) to use, e.g. 'train', 'train[:1%]'")
-    p.add_argument("--out",              required=True)
-    p.add_argument("--device",           choices=["cpu", "gpu"], default="gpu")
+    p.add_argument("--train-split",    default="train",
+                   help="split or slice, e.g. 'train', 'train[:1%]'")
+    p.add_argument("--out",            required=True)
+    p.add_argument("--device",         choices=["cpu", "gpu"], default="gpu")
     p.add_argument("--resume")
     return p.parse_args()
 
@@ -329,12 +324,9 @@ def main():
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
     pad_id = sp.piece_to_id("<pad>") if sp.piece_to_id("<pad>") >= 0 else -100
 
-    # ─── heterogeneous local batch sizes ───────────────────────
-    if rank == 2:
-        LOCAL_BS = 16
-    else:
-        LOCAL_BS = cfg.train_batch_size
-    SCALE = LOCAL_BS / cfg.train_batch_size
+    # ─── per-GPU micro-batch; keep global batch via accumulation ───
+    LOCAL_BS    = 4        # smaller micro-batch
+    ACCUM_STEPS = 16       # 4 × 16 = original global batch 64
 
     # ─── streaming dataset load & preprocess ────────────────────
     for attempt in range(1, 6):
@@ -346,7 +338,7 @@ def main():
                 split=args.train_split,
                 streaming=True,
                 download_config=download_config,
-                trust_remote_code=True
+                trust_remote_code=True,
             )
             print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
             break
@@ -356,65 +348,34 @@ def main():
                 raise
             time.sleep(5)
 
-    print(f"[Rank {rank}] about to map→encode_sp", flush=True)
     ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-    print(f"[Rank {rank}] ✔ map complete", flush=True)
-
-    print(f"[Rank {rank}] about to shard (shard={rank}/{size})", flush=True)
     ds = ds.shard(num_shards=size, index=rank, contiguous=True)
-    print(f"[Rank {rank}] ✔ shard complete", flush=True)
-
-    seed = 42 + rank
-    print(f"[Rank {rank}] about to shuffle(seed={seed})", flush=True)
-    ds = ds.shuffle(seed=seed)
-    print(f"[Rank {rank}] ✔ shuffle complete", flush=True)
-
-    print(f"[Rank {rank}] dataset stream ready, entering iterator...", flush=True)
+    ds = ds.shuffle(seed=42 + rank)
     train_it = sample_generator(ds, cfg.context_size, LOCAL_BS)
 
-    # optional streaming validation
+    # optional validation
     val_it = None
     try:
-        for attempt in range(1, 6):
-            try:
-                print(f"[Rank {rank}] validation load try {attempt}/5 …", flush=True)
-                val_ds = load_dataset(
-                    args.dataset,
-                    args.dataset_config,
-                    split="validation",
-                    streaming=True,
-                    trust_remote_code=True,
-                    download_config=download_config,
-                )
-                print(f"[Rank {rank}] ✔ validation load complete", flush=True)
-                break
-            except Exception as e:
-                print(f"[Rank {rank}] ⚠️ validation load failed: {e!r}", flush=True)
-                if attempt == 5:
-                    raise
-                time.sleep(5)
-
-        print(f"[Rank {rank}] about to map→encode_sp on validation", flush=True)
+        val_ds = load_dataset(
+            args.dataset,
+            args.dataset_config,
+            split="validation",
+            streaming=True,
+            trust_remote_code=True,
+            download_config=download_config,
+        )
         val_ds = val_ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-        print(f"[Rank {rank}] ✔ validation map complete", flush=True)
-
-        print(f"[Rank {rank}] about to shard validation (shard={rank}/{size})", flush=True)
         val_ds = val_ds.shard(num_shards=size, index=rank, contiguous=True)
-        print(f"[Rank {rank}] ✔ validation shard complete", flush=True)
-
-        vseed = 999 + rank
-        print(f"[Rank {rank}] about to shuffle validation(seed={vseed})", flush=True)
-        val_ds = val_ds.shuffle(seed=vseed)
-        print(f"[Rank {rank}] ✔ validation shuffle complete", flush=True)
-
-        print(f"[Rank {rank}] validation stream ready, entering iterator...", flush=True)
+        val_ds = val_ds.shuffle(seed=999 + rank)
         val_it = sample_generator(val_ds, cfg.context_size, LOCAL_BS)
+        print(f"[Rank {rank}] validation stream ready", flush=True)
     except Exception:
-        pass
+        print(f"[Rank {rank}] validation stream disabled", flush=True)
 
     # model & optimizer
     model = OpenELM(cfg)
-    opt = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8, weight_decay=cfg.weight_decay)
+    opt = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8,
+                      weight_decay=cfg.weight_decay)
     if cfg.torch_dtype == "bfloat16" and hasattr(mx, "set_default_dtype"):
         mx.set_default_dtype(mx.bfloat16)
 
@@ -432,9 +393,6 @@ def main():
     _broadcast_params(model.parameters(), rank)
     print(f"[Rank {rank}] weights synced – entering loop (local_bs={LOCAL_BS})", flush=True)
 
-    # mini warm-up restart length
-    RESTART_WARM = 1000
-
     # loss / grad fn
     def loss_fn(m, batch):
         x, y = batch[:, :-1], batch[:, 1:]
@@ -448,20 +406,22 @@ def main():
         return (ce * valid).sum() / valid.sum()
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
-    _ = value_and_grad(model, next(train_it))
+
+    # tiny warm-up compile
+    tiny_tokens = mx.array(np.zeros((1, 4), dtype=np.int32))
+    _ = value_and_grad(model, tiny_tokens)
     mx.eval(_)
 
-    # ─────────────────── training loop with gradient accumulation ────────────────
-    out_dir = pathlib.Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # training loop with grad accumulation
+    out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     acc_l = acc_s = 0
-
-    ACCUM_STEPS = 4  # ramped up from 4 to 8 micro-batches per update
     accum_grads: Any = None
     micro_step = 0
+    RESTART_WARM = 1_000
 
     for global_step in range(start_step + 1, cfg.max_iterations + 1):
-        # LR schedule
+
+        # learning-rate schedule
         if global_step < start_step + RESTART_WARM:
             opt.learning_rate = cfg.max_lr * (global_step - start_step) / RESTART_WARM
         else:
@@ -476,17 +436,18 @@ def main():
         # forward + grad
         loss, grads = value_and_grad(model, next(train_it))
         mx.eval(loss, grads)
-        grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
+        grads = tree_map(
+            lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads
+        )
 
-        # accumulate local grads
-        if accum_grads is None:
-            accum_grads = grads
-        else:
-            accum_grads = tree_map(lambda a, g: a + g if isinstance(a, mx.array) else a,
-                                   accum_grads, grads)
+        # accumulate
+        accum_grads = grads if accum_grads is None else tree_map(
+            lambda a, g: a + g if isinstance(a, mx.array) else a,
+            accum_grads, grads
+        )
         micro_step += 1
 
-        # update once enough micro-batches are accumulated
+        # update
         if micro_step == ACCUM_STEPS:
             clipped = clip_global(accum_grads, cfg.grad_clip)
             clipped = tree_map(lambda g: mx.distributed.all_sum(g), clipped)
@@ -494,11 +455,10 @@ def main():
             mx.eval(model.parameters())
 
             accum_grads = None
-            micro_step = 0
+            micro_step  = 0
 
             local_loss = float(loss)
-            acc_l += local_loss
-            acc_s += 1
+            acc_l += local_loss; acc_s += 1
             if global_step % 10 == 0 and rank == 0:
                 print(
                     f"[{global_step}/{cfg.max_iterations}] "
@@ -508,7 +468,16 @@ def main():
                 )
                 acc_l = acc_s = 0
 
-        # optional validation & checkpointing omitted for brevity
+        # optional validation
+        if val_it is not None and global_step % cfg.eval_every == 0 and micro_step == 0:
+            model.eval()  # inference mode
+            v_loss = np.mean([
+                float(loss_fn(model, next(val_it)))
+                for _ in range(4)
+            ])
+            model.train()  # back to training mode
+            if rank == 0:
+                print(f"[{global_step}]  ★ val_loss={v_loss:.3f}", flush=True)
 
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
