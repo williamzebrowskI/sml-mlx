@@ -447,7 +447,6 @@ def main():
         )
         micro_step += 1
 
-        # update
         if micro_step == ACCUM_STEPS:
             clipped = clip_global(accum_grads, cfg.grad_clip)
             clipped = tree_map(lambda g: mx.distributed.all_sum(g), clipped)
@@ -457,10 +456,35 @@ def main():
             accum_grads = None
             micro_step  = 0
 
+            # ───────────────────────── checkpoint + quick probe ─────────────────────────
             if rank == 0 and global_step % 5000 == 0 and global_step != 0:
                 ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
                 model.save_weights(str(ckpt_path))
                 print(f"[{global_step}] ✔ saved {ckpt_path.name}", flush=True)
+
+                # one-line coherency sample (top-k / temperature sampling, 20 tokens)
+                model.eval()                               # inference mode
+                prompt = "The quick brown fox"
+                ids    = sp.encode(prompt, out_type=int)
+                x      = mx.array(ids, dtype=mx.int32)[None, :]
+                top_k, temp = 40, 0.7
+
+                for _ in range(20):                        # generate 20 new tokens
+                    logits = model(x)[0, -1] / max(temp, 1e-6)
+                    if 0 < top_k < logits.size:
+                        kth = mx.topk(logits, k=top_k)[-1]
+                        logits = mx.where(logits < kth, -mx.inf, logits)
+                    probs = nn.softmax(logits, axis=-1)
+                    nxt   = int(mx.random.categorical(probs))
+                    x     = mx.concatenate([x,
+                            mx.array([[nxt]], dtype=mx.int32)], axis=1)
+                    if nxt == sp.eos_id():
+                        break
+
+                sample = sp.decode(list(x[0, len(ids):].tolist()))
+                model.train()                              # back to training
+                print(f"[{global_step}] ▶ \"{prompt} …{sample}\"", flush=True)
+            # ────────────────────────────────────────────────────────────────────────────
 
             local_loss = float(loss)
             acc_l += local_loss; acc_s += 1
