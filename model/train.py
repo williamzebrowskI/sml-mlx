@@ -421,7 +421,6 @@ def main():
                 min_lr=cfg.min_lr,
             )
 
-        # forward + grad
         loss, grads = value_and_grad(model, next(train_it)); mx.eval(loss, grads)
         grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
 
@@ -436,14 +435,40 @@ def main():
 
             accum_grads = None; micro_step = 0
 
-            # ─── checkpoint & correct global offset ──────────────
-            if rank == 0 and global_step % 5000 == 0:
-                ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
-                model.save_weights(str(ckpt_path))
-                processed = global_step * tokens_per_update
-                offset_file.write_text(str(processed))
-                print(f"[{global_step}] ✔ saved {ckpt_path.name} | "
-                      f"offset={processed:,}", flush=True)
+            # ── rank-0 bookkeeping, now safely inside the step block ──
+            if rank == 0:
+                acc_l += float(loss); acc_s += 1
+
+                if global_step % 10 == 0:
+                    print(f"[{global_step}/{cfg.max_iterations}] "
+                        f"loss={acc_l/acc_s:.3f} "
+                        f"lr={opt.learning_rate:.2e}", flush=True)
+                    acc_l = acc_s = 0
+
+                if global_step % 5000 == 0:
+                    ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
+                    model.save_weights(str(ckpt_path))
+                    processed = global_step * tokens_per_update
+                    offset_file.write_text(str(processed))
+                    print(f"[{global_step}] ✔ saved {ckpt_path.name} | "
+                        f"offset={processed:,}", flush=True)
+
+                    # quick 20-token probe
+                    model.eval()
+                    prompt = "The quick brown fox"
+                    ids = sp.encode(prompt, out_type=int)
+                    x   = mx.array(ids, dtype=mx.int32)[None, :]
+                    for _ in range(20):
+                        logits = model(x)[0, -1] / 0.7
+                        kth = mx.topk(logits, k=40)[-1]
+                        logits = mx.where(logits < kth, -mx.inf, logits)
+                        probs  = nn.softmax(logits, axis=-1)
+                        nxt    = int(mx.random.categorical(probs))
+                        x      = mx.concatenate([x, mx.array([[nxt]], dtype=mx.int32)], axis=1)
+                        if nxt == sp.eos_id(): break
+                    sample = sp.decode(list(x[0, len(ids):].tolist()))
+                    model.train()
+                    print(f"[{global_step}] ▶ \"{prompt} …{sample}\"", flush=True)
             # ─────────────────────────────────────────────────────
 
             acc_l += float(loss); acc_s += 1
