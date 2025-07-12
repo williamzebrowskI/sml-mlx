@@ -367,26 +367,7 @@ def main():
     )
     # running token counter
     tokens_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
-    # ────────────────────────────────────────────────────────────
-
-    # optional validation iterator, model/opt creation … (unchanged)
-    val_it = None
-    try:
-        val_ds = load_dataset(
-            args.dataset,
-            args.dataset_config,
-            split="validation",
-            streaming=True,
-            trust_remote_code=True,
-            download_config=download_config,
-        )
-        val_ds = val_ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-        val_ds = val_ds.shard(num_shards=size, index=rank, contiguous=True)
-        val_ds = val_ds.shuffle(seed=999 + rank)
-        val_it = sample_generator(val_ds, cfg.context_size, LOCAL_BS)
-        print(f"[Rank {rank}] validation stream ready", flush=True)
-    except Exception:
-        print(f"[Rank {rank}] validation stream disabled", flush=True)
+    # ───────────────────────────────────────────────────────────
 
     model = OpenELM(cfg)
     opt   = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8,
@@ -472,7 +453,6 @@ def main():
                       f"lr={opt.learning_rate:.2e}", flush=True)
                 acc_l = acc_s = 0
 
-        # validation block (unchanged) …
 
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))

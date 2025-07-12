@@ -1,36 +1,45 @@
 {
   "model_type": "OpenSML",
   "architectures": ["OpenSMLCasual"],
+
   "bos_token_id": 1,
   "eos_token_id": 2,
   "vocab_size": 50096,
+
   "num_transformer_layers": 14,
-  "model_dim":            1152,
-  "head_dim":               64,
-  "num_query_heads": [18,18,18,18,20,20,20,22,22,22,24,24,24,24],
-  "num_kv_heads":    [ 4, 4, 4, 4, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6],
-  "num_gqa_groups":        4,
+  "model_dim": 1152,
+  "head_dim": 64,
+
+  "num_query_heads": [16,16,16,16,16,16,16,16,16,16,16,16,16,16],
+  "num_kv_heads":    [ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+  "num_gqa_groups": 4,           
+
   "normalize_qk_projections": true,
+
   "ffn_multipliers": [0.5,0.6,0.8,1.0,1.4,1.8,2.2,2.6,3.0,3.4,3.8,3.8,3.8,3.8],
   "ffn_dim_divisor": 256,
-  "ffn_with_glu":    true,
+  "ffn_with_glu": true,
+
   "rope_freq_constant": 10000,
   "rope_max_length":    4096,
   "normalization_layer_name": "rms_norm",
   "activation_fn_name": "swish",
-  "initializer_range":  0.02,
+  "initializer_range": 0.02,
   "share_input_output_layers": true,
-  "context_size":      512,
-  "train_batch_size":   16,
-  "max_iterations": 1000000,
-  "warmup_iterations":   300,
-  "qkv_multipliers":  [0.5,1.0],
+
+  "context_size":     512,
+  "train_batch_size": 16,
+  "max_iterations":   1000000,
+  "warmup_iterations": 300,
+  "qkv_multipliers": [0.5, 1.0],
+
   "max_lr": 0.0000515625,
   "min_lr": 0.00004125,
   "dropout": 0.0,
   "weight_decay": 0.01,
   "grad_clip": 0.5,
-  "use_cache":  true,
+
+  "use_cache": true,
   "mlx_dtype": "bfloat16",
   "transformers_version": "4.39.3",
   "tokenizer_path": "tokenizer/spm.model",
