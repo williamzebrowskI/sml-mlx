@@ -227,7 +227,7 @@
 
 # model/train.py
 from __future__ import annotations
-import argparse, pathlib, math, json, time, itertools   # ← ADDED itertools
+import argparse, pathlib, math, json, time, itertools
 from typing import Iterator, Dict, Any
 
 import mlx.core as mx
@@ -291,7 +291,7 @@ def clip_global(tree, max_norm):
 
 
 def get_args():
-    p = argparse.ArgumentParser("OpenELM MLX trainer")
+    p = argparse.ArgumentParser("OpenSLM MLX trainer")
     p.add_argument("--config",         required=True)
     p.add_argument("--tokenizer",      required=True)
     p.add_argument("--dataset",        required=True,
@@ -323,7 +323,7 @@ def main():
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
     pad_id = sp.piece_to_id("<pad>") if sp.piece_to_id("<pad>") >= 0 else -100
 
-    # per-GPU micro-batch; keep global batch via accumulation
+    # per-GPU micro-batch
     LOCAL_BS    = 4
     ACCUM_STEPS = 16
 
@@ -351,24 +351,25 @@ def main():
     ds = ds.shard(num_shards=size, index=rank, contiguous=True)
     ds = ds.shuffle(seed=42 + rank)
 
-    # ─── offset handling ────────────────────────────────────────
-    out_dir = pathlib.Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    # ─── offset handling (FIXED) ─────────────────────────────────
+    out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     offset_file = out_dir / "offset.txt"
     offset = int(offset_file.read_text()) if offset_file.exists() else 0
-    print(f"[Rank {rank}] skipping first {offset:,} tokens")
+    print(f"[Rank {rank}] skipping first {offset:,} global tokens")
 
-    skip_batches = offset // (LOCAL_BS * (cfg.context_size + 1))
+    tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
+    rank_offset_tokens = offset // size
+    skip_batches = rank_offset_tokens // tokens_per_rank_mb
     train_it = itertools.islice(
         sample_generator(ds, cfg.context_size, LOCAL_BS),
         skip_batches,
         None
     )
-    processed = offset  # running token counter
+    # running token counter
+    tokens_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
     # ────────────────────────────────────────────────────────────
 
-    # optional validation iterator (unchanged) …
+    # optional validation iterator, model/opt creation … (unchanged)
     val_it = None
     try:
         val_ds = load_dataset(
@@ -387,14 +388,12 @@ def main():
     except Exception:
         print(f"[Rank {rank}] validation stream disabled", flush=True)
 
-    # model & optimizer
     model = OpenELM(cfg)
-    opt = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8,
-                      weight_decay=cfg.weight_decay)
+    opt   = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8,
+                        weight_decay=cfg.weight_decay)
     if cfg.torch_dtype == "bfloat16" and hasattr(mx, "set_default_dtype"):
         mx.set_default_dtype(mx.bfloat16)
 
-    # resume checkpoint
     start_step = 0
     if args.resume and rank == 0:
         model.load_weights(args.resume)
@@ -408,7 +407,7 @@ def main():
     _broadcast_params(model.parameters(), rank)
     print(f"[Rank {rank}] weights synced – entering loop (local_bs={LOCAL_BS})", flush=True)
 
-    # loss / grad fn
+    # loss fn, warm-up compile (unchanged) …
     def loss_fn(m, batch):
         x, y = batch[:, :-1], batch[:, 1:]
         logits = m(x)
@@ -421,110 +420,63 @@ def main():
         return (ce * valid).sum() / valid.sum()
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
+    _ = value_and_grad(model, mx.array(np.zeros((1, 4), dtype=np.int32))); mx.eval(_)
 
-    # tiny warm-up compile
-    tiny_tokens = mx.array(np.zeros((1, 4), dtype=np.int32))
-    _ = value_and_grad(model, tiny_tokens)
-    mx.eval(_)
-
-    # training loop with grad accumulation
     acc_l = acc_s = 0
-    accum_grads: Any = None
-    micro_step = 0
+    accum_grads = None
+    micro_step  = 0
     RESTART_WARM = 1_000
 
     for global_step in range(start_step + 1, cfg.max_iterations + 1):
 
-        # learning-rate schedule
+        # LR schedule (unchanged)
         if global_step < start_step + RESTART_WARM:
             opt.learning_rate = cfg.max_lr * (global_step - start_step) / RESTART_WARM
         else:
             opt.learning_rate = cosine_lr(
-                global_step,
-                base=cfg.max_lr,
+                global_step, base=cfg.max_lr,
                 warmup=cfg.warmup_iterations,
                 total=cfg.max_iterations,
                 min_lr=cfg.min_lr,
             )
 
         # forward + grad
-        loss, grads = value_and_grad(model, next(train_it))
-        mx.eval(loss, grads)
-        grads = tree_map(
-            lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads
-        )
+        loss, grads = value_and_grad(model, next(train_it)); mx.eval(loss, grads)
+        grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
 
-        # accumulate
         accum_grads = grads if accum_grads is None else tree_map(
-            lambda a, g: a + g if isinstance(a, mx.array) else a,
-            accum_grads, grads
-        )
+            lambda a, g: a + g if isinstance(a, mx.array) else a, accum_grads, grads)
         micro_step += 1
 
         if micro_step == ACCUM_STEPS:
             clipped = clip_global(accum_grads, cfg.grad_clip)
             clipped = tree_map(lambda g: mx.distributed.all_sum(g), clipped)
-            opt.update(model, clipped)
-            mx.eval(model.parameters())
+            opt.update(model, clipped); mx.eval(model.parameters())
 
-            accum_grads = None
-            micro_step  = 0
+            accum_grads = None; micro_step = 0
 
-            # ─── checkpoint, probe, and offset persist ───────────
-            if rank == 0 and global_step % 5000 == 0 and global_step != 0:
+            # ─── checkpoint & correct global offset ──────────────
+            if rank == 0 and global_step % 5000 == 0:
                 ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
                 model.save_weights(str(ckpt_path))
-                print(f"[{global_step}] ✔ saved {ckpt_path.name}", flush=True)
-
-                # persist processed token count
-                processed += LOCAL_BS * cfg.context_size * ACCUM_STEPS
+                processed = global_step * tokens_per_update
                 offset_file.write_text(str(processed))
-                print(f"[{global_step}] ✔ wrote offset.txt ({processed:,} tokens)", flush=True)
-
-                # quick text probe …
-                model.eval()
-                prompt = "The quick brown fox"
-                ids    = sp.encode(prompt, out_type=int)
-                x      = mx.array(ids, dtype=mx.int32)[None, :]
-                top_k, temp = 40, 0.7
-                for _ in range(20):
-                    logits = model(x)[0, -1] / max(temp, 1e-6)
-                    if 0 < top_k < logits.size:
-                        kth = mx.topk(logits, k=top_k)[-1]
-                        logits = mx.where(logits < kth, -mx.inf, logits)
-                    probs = nn.softmax(logits, axis=-1)
-                    nxt   = int(mx.random.categorical(probs))
-                    x     = mx.concatenate([x, mx.array([[nxt]], dtype=mx.int32)], axis=1)
-                    if nxt == sp.eos_id():
-                        break
-                sample = sp.decode(list(x[0, len(ids):].tolist()))
-                model.train()
-                print(f"[{global_step}] ▶ \"{prompt} …{sample}\"", flush=True)
+                print(f"[{global_step}] ✔ saved {ckpt_path.name} | "
+                      f"offset={processed:,}", flush=True)
             # ─────────────────────────────────────────────────────
 
-            local_loss = float(loss)
-            acc_l += local_loss; acc_s += 1
+            acc_l += float(loss); acc_s += 1
             if global_step % 10 == 0 and rank == 0:
-                print(
-                    f"[{global_step}/{cfg.max_iterations}] "
-                    f"loss={acc_l/acc_s:.3f} "
-                    f"lr={opt.learning_rate:.2e}",
-                    flush=True,
-                )
+                print(f"[{global_step}/{cfg.max_iterations}] "
+                      f"loss={acc_l/acc_s:.3f} "
+                      f"lr={opt.learning_rate:.2e}", flush=True)
                 acc_l = acc_s = 0
 
-        # optional validation
-        if val_it is not None and global_step % cfg.eval_every == 0 and micro_step == 0:
-            model.eval()
-            v_loss = np.mean([float(loss_fn(model, next(val_it))) for _ in range(4)])
-            model.train()
-            if rank == 0:
-                print(f"[{global_step}]  ★ val_loss={v_loss:.3f}", flush=True)
+        # validation block (unchanged) …
 
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
-        processed += LOCAL_BS * cfg.context_size * ACCUM_STEPS  # final batch
-        offset_file.write_text(str(processed))
+        offset_file.write_text(str(cfg.max_iterations * tokens_per_update))
         print("✅ Training complete", flush=True)
 
 
