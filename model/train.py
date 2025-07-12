@@ -366,7 +366,8 @@ def main():
         None
     )
     # running token counter
-    tokens_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
+    # tokens_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
+    # tokens_per_micro = size * LOCAL_BS * (cfg.context_size + 1)
     # ───────────────────────────────────────────────────────────
 
     model = OpenELM(cfg)
@@ -440,7 +441,7 @@ def main():
             if rank == 0 and global_step % 5000 == 0:
                 ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
                 model.save_weights(str(ckpt_path))
-                processed = global_step * tokens_per_update
+                processed = global_step * (size * LOCAL_BS * (cfg.context_size + 1))
                 offset_file.write_text(str(processed))
                 print(f"[{global_step}] ✔ saved {ckpt_path.name} | "
                       f"offset={processed:,}", flush=True)
@@ -456,7 +457,8 @@ def main():
 
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
-        offset_file.write_text(str(cfg.max_iterations * tokens_per_update))
+        offset_file.write_text(str(cfg.max_iterations *
+                           (size * LOCAL_BS * (cfg.context_size + 1))))
         print("✅ Training complete", flush=True)
 
 
