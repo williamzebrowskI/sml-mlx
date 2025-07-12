@@ -353,18 +353,19 @@ def main():
 
     # ─── offset handling (FIXED) ─────────────────────────────────
     out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
-    offset_file = out_dir / "offset.txt"
-    offset = int(offset_file.read_text()) if offset_file.exists() else 0
-    print(f"[Rank {rank}] skipping first {offset:,} global tokens")
+    # offset_file = out_dir / "offset.txt"
+    # offset = int(offset_file.read_text()) if offset_file.exists() else 0
+    # print(f"[Rank {rank}] skipping first {offset:,} global tokens")
 
-    tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
-    rank_offset_tokens = offset // size
-    skip_batches = rank_offset_tokens // tokens_per_rank_mb
-    train_it = itertools.islice(
-        sample_generator(ds, cfg.context_size, LOCAL_BS),
-        skip_batches,
-        None
-    )
+    # tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
+    # rank_offset_tokens = offset // size
+    # skip_batches = rank_offset_tokens // tokens_per_rank_mb
+    # train_it = itertools.islice(
+    #     sample_generator(ds, cfg.context_size, LOCAL_BS),
+    #     skip_batches,
+    #     None
+    # )
+    train_it = sample_generator(ds, cfg.context_size, LOCAL_BS) 
     # running token counter
     # tokens_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
     # tokens_per_micro = size * LOCAL_BS * (cfg.context_size + 1)
@@ -442,7 +443,7 @@ def main():
                 ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
                 model.save_weights(str(ckpt_path))
                 processed = global_step * (size * LOCAL_BS * (cfg.context_size + 1))
-                offset_file.write_text(str(processed))
+                # offset_file.write_text(str(processed))
                 print(f"[{global_step}] ✔ saved {ckpt_path.name} | "
                       f"offset={processed:,}", flush=True)
             # ─────────────────────────────────────────────────────
@@ -457,8 +458,8 @@ def main():
 
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
-        offset_file.write_text(str(cfg.max_iterations *
-                           (size * LOCAL_BS * (cfg.context_size + 1))))
+        # offset_file.write_text(str(cfg.max_iterations *
+        #                    (size * LOCAL_BS * (cfg.context_size + 1))))
         print("✅ Training complete", flush=True)
 
 
