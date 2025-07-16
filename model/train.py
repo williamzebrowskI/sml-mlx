@@ -330,6 +330,7 @@ def main():
     # streaming dataset load & preprocess
     for attempt in range(1, 6):
         try:
+            time.sleep(5)
             print(f"[Rank {rank}] load_dataset try {attempt}/5 …", flush=True)
             ds = load_dataset(
                 args.dataset,
@@ -339,7 +340,6 @@ def main():
                 download_config=download_config,
                 trust_remote_code=True,
             )
-            time.sleep(5)
             print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
             break
         except Exception as e:
