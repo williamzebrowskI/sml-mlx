@@ -339,6 +339,7 @@ def main():
                 download_config=download_config,
                 trust_remote_code=True,
             )
+            time.sleep(5)
             print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
             break
         except Exception as e:
