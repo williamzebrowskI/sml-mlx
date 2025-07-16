@@ -270,15 +270,15 @@ def main() -> None:
     # -------- 10 prompt / sampling tuples --------
     RUNS: List[Tuple[str, float, int]] = [
         ("The quick brown fox",              0.7, 40),
-        # ("Explain quantum computing to me",  0.9, 20),
-        # ("In the future, humans will",       1.2, 50),
-        # ("A recipe for blueberry muffins:",  0.8, 30),
-        # ("Once upon a time",                 1.0, 40),
-        # ("Python list comprehension is",     0.6, 15),
-        # ("Describe the city of Paris.",      0.9, 40),
-        # ("Write a haiku about rain.",        0.8, 20),
-        # ("Pros and cons of electric cars:",  1.1, 50),
-        # ("What is the meaning of life?",     0.7, 40),
+        ("Explain quantum computing to me",  0.9, 20),
+        ("In the future, humans will",       1.2, 50),
+        ("A recipe for blueberry muffins:",  0.8, 30),
+        ("Once upon a time",                 1.0, 40),
+        ("Python list comprehension is",     0.6, 15),
+        ("Describe the city of Paris.",      0.9, 40),
+        ("Write a haiku about rain.",        0.8, 20),
+        ("Pros and cons of electric cars:",  1.1, 50),
+        ("What is the meaning of life?",     0.7, 40),
     ]
     # --------------------------------------------
 
