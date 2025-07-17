@@ -242,6 +242,9 @@ import numpy as np
 
 from model.model import OpenELM, SMLMConfig
 
+import socket, os
+print(f"[BOOT] host={socket.gethostname()} rank_env={os.getenv('MLX_RANK')}")
+
 
 # ───────────────────────── barrier & broadcast helpers ─────────
 def _barrier() -> None:
