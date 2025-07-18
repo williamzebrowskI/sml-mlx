@@ -256,12 +256,12 @@ def load_latest_or_given(cfg_path: str, spm_path: str,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("OpenELM 10-run sampler")
+    ap = argparse.ArgumentParser("OpenSML 10-run sampler")
     ap.add_argument("--config", required=True)
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--checkpoint")
     ap.add_argument("--ckpt-dir", default="runs/sml-lm")
-    ap.add_argument("--max-new", type=int, default=128)
+    ap.add_argument("--max-new", type=int, default=10)
     args = ap.parse_args()
 
     model, tok = load_latest_or_given(args.config, args.tokenizer,
@@ -269,8 +269,8 @@ def main() -> None:
 
     # -------- 10 prompt / sampling tuples --------
     RUNS: List[Tuple[str, float, int]] = [
-        ("The quick brown fox",              0.5, 20),
-        ("Explain quantum computing to me",  0.1, 5),
+        ("The captial of France is ",              0.5, 20),
+        ("The Zebra ",  0.1, 5),
         # ("In the future, humans will",       1.2, 50),
         # ("A recipe for blueberry muffins:",  0.8, 30),
         # ("Once upon a time",                 1.0, 40),
