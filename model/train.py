@@ -468,20 +468,10 @@ def main():
                       f"loss={acc_l/acc_s:.3f} "
                       f"lr={opt.learning_rate:.2e}", flush=True)
                 
-                # gather all gradient arrays into a flat list
-                grad_arrays: list[mx.array] = []
-                def _collect(x):
-                    if isinstance(x, mx.array):
-                        grad_arrays.append(x)
-                    return x
-
-                tree_map(_collect, grads)
-                grad_norm = math.sqrt(sum(float((g**2).sum()) for g in grad_arrays))
                 wandb.log({
                     "train/loss": avg_loss,
                     "train/perplexity": perp,
-                    "train/lr": opt.learning_rate,
-                    "train/grad_norm": grad_norm
+                    "train/lr": opt.learning_rate
                 }, step=global_step)
                 acc_l = acc_s = 0
 
