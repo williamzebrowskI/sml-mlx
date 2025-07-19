@@ -420,7 +420,7 @@ def main():
     acc_l = acc_s = 0
     accum_grads = None
     micro_step  = 0
-    RESTART_WARM = 10000
+    RESTART_WARM = 20000
 
     for global_step in range(start_step + 1, cfg.max_iterations + 1):
 

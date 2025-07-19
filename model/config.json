@@ -30,10 +30,10 @@
   "context_size":     512,
   "train_batch_size": 16,
   "max_iterations":   1000000,
-  "warmup_iterations": 10000,
+  "warmup_iterations": 20000,
   "qkv_multipliers": [0.5, 1.0],
 
-  "max_lr": 0.0005,
+  "max_lr": 0.0001,
   "min_lr": 0.000001,
   "dropout": 0.0,
   "weight_decay": 0.01,
