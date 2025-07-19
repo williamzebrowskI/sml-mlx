@@ -469,10 +469,10 @@ def main():
                       f"lr={opt.learning_rate:.2e}", flush=True)
                 
                 wandb.log({
-                    "train/loss": avg_loss,
-                    "train/perplexity": perp,
-                    "train/lr": opt.learning_rate
-                }, step=global_step)
+                    "train/loss":       float(avg_loss),
+                    "train/perplexity": float(perp),
+                    "train/lr":         float(opt.learning_rate)
+                }, step=int(global_step))
                 acc_l = acc_s = 0
 
 
