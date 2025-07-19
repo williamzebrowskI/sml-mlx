@@ -235,6 +235,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import mlx.nn.losses as losses
 from mlx.utils import tree_map
+import wandb
 
 from datasets import load_dataset, DownloadConfig
 import sentencepiece as spm
@@ -394,6 +395,13 @@ def main():
     _broadcast_params(model.parameters(), rank)
     print(f"[Rank {rank}] weights synced – entering loop (local_bs={LOCAL_BS})", flush=True)
 
+    if rank == 0:
+        wandb.init(
+          project="fineweb-pretrain",
+          config={**cfg.__dict__, "LOCAL_BS": LOCAL_BS, "ACCUM_STEPS": ACCUM_STEPS, "world_size": size},
+          name=f"pretrain-{start_step:06d}"
+        )
+
     # loss fn, warm-up compile (unchanged) …
     def loss_fn(m, batch):
         x, y = batch[:, :-1], batch[:, 1:]
@@ -412,7 +420,7 @@ def main():
     acc_l = acc_s = 0
     accum_grads = None
     micro_step  = 0
-    RESTART_WARM = 1_000
+    RESTART_WARM = 10000
 
     for global_step in range(start_step + 1, cfg.max_iterations + 1):
 
@@ -454,9 +462,19 @@ def main():
 
             acc_l += float(loss); acc_s += 1
             if global_step % 10 == 0 and rank == 0:
+                avg_loss = acc_l/acc_s
+                perp = math.exp(avg_loss)
                 print(f"[{global_step}/{cfg.max_iterations}] "
                       f"loss={acc_l/acc_s:.3f} "
                       f"lr={opt.learning_rate:.2e}", flush=True)
+                
+                grad_norm = math.sqrt(sum((g**2).sum() for g in mx.flatten(grads)))
+                wandb.log({
+                    "train/loss": avg_loss,
+                    "train/perplexity": perp,
+                    "train/lr": opt.learning_rate,
+                    "train/grad_norm": grad_norm
+                }, step=global_step)
                 acc_l = acc_s = 0
 
 

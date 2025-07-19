@@ -269,8 +269,8 @@ def main() -> None:
 
     # -------- 10 prompt / sampling tuples --------
     RUNS: List[Tuple[str, float, int]] = [
-        ("The captial of France is ",              0.5, 20),
-        ("The Zebra ",  0.1, 5),
+        ("How AP reported in all formats from tornado-stricken regionsMarch 8, 2012 When the first",              0.8, 10),
+        ("Log In Please enter your ECode to",  0.7, 10),
         # ("In the future, humans will",       1.2, 50),
         # ("A recipe for blueberry muffins:",  0.8, 30),
         # ("Once upon a time",                 1.0, 40),
