@@ -329,7 +329,7 @@ def main():
 
     # per-GPU micro-batch
     LOCAL_BS    = 4
-    ACCUM_STEPS = 32
+    ACCUM_STEPS = 16
 
     # streaming dataset load & preprocess
     for attempt in range(1, 6):
