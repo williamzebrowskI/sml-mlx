@@ -269,7 +269,7 @@ def main() -> None:
 
     # -------- 10 prompt / sampling tuples --------
     RUNS: List[Tuple[str, float, int]] = [
-        ("How AP reported in all formats from tornado-stricken regionsMarch 8, 2012 When the first",              0.8, 10),
+        ("How AP reported in all ",              0.8, 10),
         ("Log In Please enter your ECode to",  0.7, 10),
         # ("In the future, humans will",       1.2, 50),
         # ("A recipe for blueberry muffins:",  0.8, 30),
