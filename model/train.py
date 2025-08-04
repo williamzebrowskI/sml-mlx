@@ -139,11 +139,11 @@ def main():
         try:
             offset = int(raw) if raw else 0
         except ValueError:
-            print(f"[Rank {rank}] ⚠️ invalid offset content {raw!r}, resetting to 0")
+            print(f"[Rank {rank}] ⚠️ invalid offset content {raw!r}, resetting to 0", flush=True)
             offset = 0
     else:
         offset = 0
-    print(f"[Rank {rank}] skipping first {offset:,} global tokens")
+    print(f"[Rank {rank}] skipping first {offset:,} global tokens", flush=True)
 
     tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
     rank_offset_tokens = offset // size
@@ -153,11 +153,6 @@ def main():
         skip_batches,
         None
     )
-    train_it = sample_generator(ds, cfg.context_size, LOCAL_BS) 
-    # running token counter
-    # tokens_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
-    # tokens_per_micro = size * LOCAL_BS * (cfg.context_size + 1)
-    # ───────────────────────────────────────────────────────────
 
     model = OpenELM(cfg)
     opt   = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8,
@@ -185,20 +180,32 @@ def main():
           name=f"pretrain-{start_step:06d}"
         )
 
-    # loss fn, warm-up compile (unchanged) …
+    # stable loss fn (with epsilon)
     def loss_fn(m, batch):
         x, y = batch[:, :-1], batch[:, 1:]
         logits = m(x)
-        valid = (y != pad_id).astype(mx.float32) if pad_id >= 0 else 1.0
+        if pad_id >= 0:
+            valid = (y != pad_id).astype(mx.float32)
+            valid_sum = valid.sum()
+        else:
+            valid = mx.ones_like(y, dtype=mx.float32)
+            valid_sum = float(y.size)  # fallback
         ce = losses.cross_entropy(
             logits.reshape(-1, cfg.vocab_size),
             y.reshape(-1),
             reduction="none",
         ).reshape(*y.shape)
-        return (ce * valid).sum() / valid.sum()
+        loss = (ce * valid).sum() / (valid_sum + 1e-6)
+        return loss
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
+    # warm-up compile
     _ = value_and_grad(model, mx.array(np.zeros((1, 4), dtype=np.int32))); mx.eval(_)
+
+    def compute_grad_norm(tree) -> float:
+        flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
+        total = math.sqrt(sum(float((g**2).sum()) for g in flats))
+        return total
 
     acc_l = acc_s = 0
     accum_grads = None
@@ -207,7 +214,7 @@ def main():
 
     for global_step in range(start_step + 1, cfg.max_iterations + 1):
 
-        # LR schedule (unchanged)
+        # LR schedule (restart warm + cosine)
         if global_step < start_step + RESTART_WARM:
             opt.learning_rate = cfg.max_lr * (global_step - start_step) / RESTART_WARM
         else:
@@ -218,51 +225,63 @@ def main():
                 min_lr=cfg.min_lr,
             )
 
-        # forward + grad
-        loss, grads = value_and_grad(model, next(train_it)); mx.eval(loss, grads)
-        grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
+        # fetch batch and compute loss+grads
+        batch = next(train_it)
+        loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
 
+        # diagnostic on NaN/Inf
+        if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
+            if rank == 0:
+                x, y = batch[:, :-1], batch[:, 1:]
+                valid = (y != pad_id).astype(mx.float32) if pad_id >= 0 else mx.ones_like(y, dtype=mx.float32)
+                valid_sum = valid.sum()
+                print(f"[{global_step}] ⚠️ NaN/Inf loss detected. valid_sum={valid_sum}", flush=True)
+            # skip this micro-step to avoid corrupting accumulation
+            continue
+
+        # scale per-micro-step for accumulation
+        grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
         accum_grads = grads if accum_grads is None else tree_map(
             lambda a, g: a + g if isinstance(a, mx.array) else a, accum_grads, grads)
         micro_step += 1
 
         if micro_step == ACCUM_STEPS:
-            clipped = clip_global(accum_grads, cfg.grad_clip)
-            clipped = tree_map(lambda g: mx.distributed.all_sum(g), clipped)
+            # aggregate across ranks
+            global_grads = tree_map(lambda g: mx.distributed.all_sum(g), accum_grads)
+            # compute gradient norm before clipping
+            grad_norm = compute_grad_norm(global_grads)
+            # clip
+            clipped = clip_global(global_grads, cfg.grad_clip)
+            # update
             opt.update(model, clipped); mx.eval(model.parameters())
 
             accum_grads = None; micro_step = 0
 
-            # ─── checkpoint & correct global offset ──────────────
+            # ─── checkpoint & offset bookkeeping ──────────────
             if rank == 0 and global_step % 5000 == 0:
                 ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
                 model.save_weights(str(ckpt_path))
                 processed = global_step * (size * LOCAL_BS * (cfg.context_size + 1))
                 offset_file.write_text(str(processed))
-                print(f"[{global_step}] ✔ saved {ckpt_path.name} | "
-                      f"offset={processed:,}", flush=True)
-            # ─────────────────────────────────────────────────────
+                print(f"[{global_step}] ✔ saved {ckpt_path.name} | offset={processed:,}", flush=True)
 
             acc_l += float(loss); acc_s += 1
             if global_step % 10 == 0 and rank == 0:
-                avg_loss = acc_l/acc_s
+                avg_loss = acc_l / acc_s
                 perp = math.exp(avg_loss)
-                print(f"[{global_step}/{cfg.max_iterations}] "
-                      f"loss={acc_l/acc_s:.3f} "
-                      f"lr={opt.learning_rate:.2e}", flush=True)
-                
+                print(f"[{global_step}/{cfg.max_iterations}] loss={avg_loss:.3f} perplexity={perp:.2f} lr={opt.learning_rate:.2e} grad_norm={grad_norm:.3f}", flush=True)
+
                 wandb.log({
                     "train/loss":       float(avg_loss),
                     "train/perplexity": float(perp),
-                    "train/lr":         float(opt.learning_rate)
+                    "train/lr":         float(opt.learning_rate),
+                    "train/grad_norm":  float(grad_norm),
                 }, step=int(global_step))
                 acc_l = acc_s = 0
 
-
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
-        offset_file.write_text(str(cfg.max_iterations *
-                           (size * LOCAL_BS * (cfg.context_size + 1))))
+        offset_file.write_text(str(cfg.max_iterations * (size * LOCAL_BS * (cfg.context_size + 1))))
         print("✅ Training complete", flush=True)
 
 
