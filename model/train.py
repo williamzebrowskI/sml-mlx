@@ -401,7 +401,14 @@ def main():
     # ─── offset handling (FIXED) ─────────────────────────────────
     out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     offset_file = out_dir / "offset.txt"
-    offset = int(offset_file.read_text()) if offset_file.exists() else 0
+    if offset_file.exists():
+        raw = offset_file.read_text().strip()
+        try:
+            offset = int(raw) if raw else 0
+        except ValueError:
+            offset = 0
+    else:
+        offset = 0
     print(f"[Rank {rank}] skipping first {offset:,} global tokens")
 
     tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
