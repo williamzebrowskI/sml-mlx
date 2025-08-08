@@ -86,7 +86,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM pipelined inference example")
     parser.add_argument(
         "--model",
-        default="mlx-community/DeepSeek-R1-3bit",
+        default="openai/gpt-oss-20b",
         help="HF repo or path to local model.",
     )
     parser.add_argument(
