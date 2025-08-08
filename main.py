@@ -1,14 +1,41 @@
-import os, socket
-import mlx.core as mx
+# from mlx_lm import load
+# model, tok = load("openai/gpt-oss-20b")
 
-backend = os.getenv("MLX_BACKEND", "any")  # 'any' tries ring first, then MPI
-world = mx.distributed.init(backend=backend)
+# def show(name, obj):
+#     try:
+#         v = eval(name, {}, {"model": model})
+#         if hasattr(v, "__len__"):
+#             print(f"{name}: len={len(v)} type={type(v)}")
+#         else:
+#             print(f"{name}: type={type(v)}")
+#     except Exception as e:
+#         print(f"{name}: !! {type(e).__name__}: {e}")
 
-rank, size = world.rank(), world.size()
+# print("=== probing ===")
+# for cand in [
+#     "model.model.layers",
+#     "model.layers",
+#     "layers",
+# ]:
+#     show(cand, model)
 
-# Simple all-reduce: sum a vector of ones across all ranks
-x = mx.ones((8,), mx.float32)
-y = mx.distributed.all_sum(x)
-mx.eval(y)  # force compute
+# for cand in [
+#     "model.model.embed_tokens",
+#     "model.embed_tokens",
+#     "embed_tokens",
+# ]:
+#     show(cand, model)
 
-print(f"host={socket.gethostname()} rank={rank}/{size} first={y[0].item()} len={y.size}")
+# for cand in [
+#     "model.lm_head",
+#     "lm_head",
+#     "model.model.lm_head",
+# ]:
+#     show(cand, model)
+
+# # If there is a final norm:
+# for cand in [
+#     "model.model.norm",
+#     "model.norm",
+# ]:
+#     show(cand, model)
