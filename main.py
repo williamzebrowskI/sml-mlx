@@ -1,41 +1,35 @@
-# from mlx_lm import load
-# model, tok = load("openai/gpt-oss-20b")
+# file: pp_local_demo.py
+import argparse, mlx.core as mx
+from mlx_lm import load, stream_generate
 
-# def show(name, obj):
-#     try:
-#         v = eval(name, {}, {"model": model})
-#         if hasattr(v, "__len__"):
-#             print(f"{name}: len={len(v)} type={type(v)}")
-#         else:
-#             print(f"{name}: type={type(v)}")
-#     except Exception as e:
-#         print(f"{name}: !! {type(e).__name__}: {e}")
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", default="openai/gpt-oss-20b")
+parser.add_argument("--prompt", default="Say hi and tell me a fun fact.")
+parser.add_argument("--max-tokens", type=int, default=128)
+args = parser.parse_args()
 
-# print("=== probing ===")
-# for cand in [
-#     "model.model.layers",
-#     "model.layers",
-#     "layers",
-# ]:
-#     show(cand, model)
+group = mx.distributed.init(backend="ring")  # or "any" / "mpi"
+rank  = group.rank()
 
-# for cand in [
-#     "model.model.embed_tokens",
-#     "model.embed_tokens",
-#     "embed_tokens",
-# ]:
-#     show(cand, model)
+# Simple rank-0 print helper
+def rprint(*a, **k):
+    if rank == 0:
+        print(*a, **k, flush=True)
 
-# for cand in [
-#     "model.lm_head",
-#     "lm_head",
-#     "model.model.lm_head",
-# ]:
-#     show(cand, model)
+# Load model/tokenizer (simple path; for big models use the example that shards downloads)
+model, tok = load(args.model)
 
-# # If there is a final norm:
-# for cand in [
-#     "model.model.norm",
-#     "model.norm",
-# ]:
-#     show(cand, model)
+# Enable pipeline partitioning across ranks if the model supports it
+if hasattr(model, "model") and hasattr(model.model, "pipeline"):
+    model.model.pipeline(group)
+else:
+    rprint("This model does not support pipeline(); falling back to single-rank behavior.")
+
+# Make a chat prompt
+messages = [{"role": "user", "content": args.prompt}]
+prompt = tok.apply_chat_template(messages, add_generation_prompt=True)
+
+# Stream tokens; only rank 0 prints
+for resp in stream_generate(model, tok, prompt, max_tokens=args.max_tokens):
+    rprint(getattr(resp, "text", str(resp)), end="")
+rprint()
