@@ -1249,6 +1249,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "mlx" },
     { name = "mlx-lm" },
+    { name = "mlx-metal" },
     { name = "rich" },
     { name = "sentencepiece" },
     { name = "tinygrad" },
@@ -1258,9 +1259,10 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
-    { name = "huggingface-hub", specifier = ">=0.31.2" },
+    { name = "huggingface-hub", specifier = ">=0.24" },
     { name = "mlx", specifier = ">=0.28.0" },
     { name = "mlx-lm", specifier = ">=0.26.3" },
+    { name = "mlx-metal", specifier = ">=0.28.0" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "tinygrad", specifier = ">=0.10.3" },
