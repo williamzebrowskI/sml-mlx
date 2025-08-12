@@ -1,13 +1,12 @@
 # model/train.py
-# MLX distributed trainer (ring) with loud, timestamped logging.
-# Highlights:
-#  - Logs around distributed init, device/dtype, tokenizer, dataset streaming, compile.
-#  - Periodic updates with loss/ppl, lr, grad-norm, updates/s, tokens/s.
-#  - fp16/bf16-safe: attention + CE computed in fp32.
-#  - Gradient accumulation + all-reduce + clip, offset resume, W&B logging.
+# MLX distributed trainer (ring) with loud logging + robust HF streaming:
+# - 429 Too Many Requests → exponential backoff + jitter, then resume
+# - rank-staggered start to spread out Hub load
+# - optional HF token login to increase Hub rate limit
+# - fp16/bf16-safe (attention + CE in fp32), grad accumulation, all-reduce, clip
 
 from __future__ import annotations
-import argparse, pathlib, math, json, time, itertools, socket, os
+import argparse, pathlib, math, json, time, itertools, socket, os, random
 from typing import Iterator, Dict, Any
 
 import mlx.core as mx
@@ -20,6 +19,13 @@ from datasets import load_dataset, DownloadConfig
 import sentencepiece as spm
 import numpy as np
 import wandb
+
+# for catching Hub throttling cleanly
+from huggingface_hub.utils import HfHubHTTPError
+try:
+    from huggingface_hub import login as hf_login
+except Exception:
+    hf_login = None
 
 from .model import OpenELM, SMLMConfig
 
@@ -46,11 +52,43 @@ def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: s
     ids = sp.encode(example[key], out_type=int, add_bos=True, add_eos=True)
     return {"ids": ids}
 
-def sample_generator(dataset: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
-    """Packs a streaming dataset into windows of length ctx+1 for LM training."""
+def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
+    """Iterate a streaming HF dataset and handle transient 429/HTTP hiccups."""
+    backoff = 2.0
+    while True:
+        it = iter(ds)
+        try:
+            for ex in it:
+                yield ex
+            # exhausted (rare for streaming) → restart loop
+        except HfHubHTTPError as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code == 429:
+                sleep_for = min(backoff, backoff_max) * (1.0 + random.random())
+                log(rank, f"HF 429 Too Many Requests → sleeping {sleep_for:.1f}s then retrying stream …")
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2.0, backoff_max)
+                continue
+            # Retry some other transient classes, too
+            if code in {500, 502, 503, 504, None}:
+                sleep_for = 5.0 * (1.0 + 0.5 * random.random())
+                log(rank, f"HF transient {code or 'error'} → backoff {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+                continue
+            # otherwise bubble up
+            raise
+        except Exception as e:
+            # Generic network hiccup
+            sleep_for = 5.0 * (1.0 + 0.5 * random.random())
+            log(rank, f"dataset iterator error: {type(e).__name__}: {e} → retry in {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+            continue
+
+def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
+    """Packs streaming tokenized examples into fixed windows of length ctx+1."""
     window, buf = ctx + 1, []
     while True:
-        for ex in dataset:
+        for ex in dataset_iter:
             buf.extend(ex["ids"])
             while len(buf) >= window * bs:
                 chunk = np.asarray(buf[: window * bs], dtype=np.int32)
@@ -94,6 +132,17 @@ def main():
     args = get_args()
     cfg = SMLMConfig.from_json(args.config)
 
+    # Optional: Hugging Face token to raise rate limits
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if token and hf_login is not None:
+        try:
+            hf_login(token=token, add_to_git_credential=False)
+            log(rank, "Hugging Face token loaded (higher Hub rate limit).")
+        except Exception as e:
+            log(rank, f"Hugging Face login failed (continuing anonymous): {e!r}")
+    else:
+        log(rank, "No HF token in env; using anonymous Hub access.")
+
     # device & default dtype
     mx.set_default_device(mx.gpu if args.device == "gpu" else mx.cpu)
     if hasattr(mx, "set_default_dtype"):
@@ -101,7 +150,6 @@ def main():
             mx.set_default_dtype(mx.float16)
         elif cfg.torch_dtype == "bfloat16":
             mx.set_default_dtype(mx.bfloat16)
-    # best-effort print of default dtype
     try:
         default_dtype = mx.default_dtype()
     except Exception:
@@ -123,7 +171,14 @@ def main():
     LOCAL_BS = int(os.getenv("LOCAL_BS", cfg.local_bs))
     ACCUM_STEPS = int(os.getenv("ACCUM_STEPS", cfg.accum_steps))
     SHUFFLE_BUF = int(os.getenv("SHUFFLE_BUFFER", 20000))
+    BACKOFF_MAX = float(os.getenv("HF_BACKOFF_MAX", "60"))
+    STAGGER = float(os.getenv("RANK_STAGGER_SEC", str(rank * 2.0)))  # default: 2s * rank
     log(rank, f"LOCAL_BS={LOCAL_BS} ACCUM_STEPS={ACCUM_STEPS} SHUFFLE_BUFFER={SHUFFLE_BUF} context={cfg.context_size}")
+    log(rank, f"rank-stagger={STAGGER:.1f}s, backoff_max={BACKOFF_MAX:.0f}s")
+
+    # Give each rank a small stagger to avoid synchronized bursts on the Hub
+    if STAGGER > 0:
+        time.sleep(STAGGER)
 
     # streaming dataset
     download_config = DownloadConfig(max_retries=5)
@@ -166,8 +221,12 @@ def main():
     tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
     rank_offset_tokens = offset // size
     skip_batches = rank_offset_tokens // tokens_per_rank_mb
+
+    # Wrap the dataset with our resilient iterator to survive 429s
+    ds_iter = resilient_dataset_iter(ds, rank, backoff_max=BACKOFF_MAX)
+
     train_it = itertools.islice(
-        sample_generator(ds, cfg.context_size, LOCAL_BS),
+        sample_generator(ds_iter, cfg.context_size, LOCAL_BS),
         skip_batches,
         None
     )
@@ -232,7 +291,7 @@ def main():
     acc_l = acc_s = 0
     accum_grads = None
     micro_step = 0
-    RESTART_WARM = 10_000  # short warm restart for smoother convergence after resume
+    RESTART_WARM = 10_000  # short warm restart
 
     # throughput accounting
     toks_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
