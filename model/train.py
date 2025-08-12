@@ -1,297 +1,10 @@
-
-
-# # model/train.py
-# from __future__ import annotations
-# import argparse, pathlib, math, json, time, itertools
-# from typing import Iterator, Dict, Any
-
-# import mlx.core as mx
-# import mlx.nn as nn
-# import mlx.optimizers as optim
-# import mlx.nn.losses as losses
-# from mlx.utils import tree_map
-# import wandb
-
-# from datasets import load_dataset, DownloadConfig
-# import sentencepiece as spm
-# import numpy as np
-
-# from model.model import OpenELM, SMLMConfig
-
-# import socket, os
-# print(f"[BOOT] host={socket.gethostname()} rank_env={os.getenv('MLX_RANK')}")
-
-
-# # ───────────────────────── barrier & broadcast helpers ─────────
-# def _barrier() -> None:
-#     mx.eval(mx.distributed.all_sum(mx.array([1], dtype=mx.int32)))
-
-
-# def _broadcast_params(params, rank: int) -> None:
-#     for p in tree_map(lambda x: x, params):
-#         if not isinstance(p, mx.array):
-#             continue
-#         if rank != 0:
-#             p[...] = 0
-#         p[...] = mx.distributed.all_sum(p)
-
-
-# # ───────────────────────── misc helpers ────────────────────────
-# def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: str):
-#     ids = sp.encode(example[key], out_type=int, add_bos=True, add_eos=True)
-#     return {"ids": ids}
-
-
-# def sample_generator(dataset: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
-#     window, buf = ctx + 1, []
-#     while True:
-#         for ex in dataset:
-#             buf.extend(ex["ids"])
-#             while len(buf) >= window * bs:
-#                 chunk = np.asarray(buf[: window * bs], dtype=np.int32)
-#                 del buf[: window * bs]
-#                 yield mx.array(chunk).reshape(bs, window)
-
-
-# def cosine_lr(step, *, base, warmup, total, min_lr):
-#     if step < warmup:
-#         return base * step / warmup
-#     t = (step - warmup) / (total - warmup)
-#     return min_lr + 0.5 * (base - min_lr) * (1 + math.cos(math.pi * t))
-
-
-# def clip_global(tree, max_norm):
-#     flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
-#     total = math.sqrt(sum(float((g**2).sum()) for g in flats))
-#     if total <= max_norm:
-#         return tree
-#     scale = max_norm / (total + 1e-6)
-#     return tree_map(lambda x: x * scale if isinstance(x, mx.array) else x, tree)
-
-
-# def get_args():
-#     p = argparse.ArgumentParser("OpenSLM MLX trainer")
-#     p.add_argument("--config",         required=True)
-#     p.add_argument("--tokenizer",      required=True)
-#     p.add_argument("--dataset",        required=True,
-#                    help="HF dataset id (streaming)")
-#     p.add_argument("--dataset-config", default=None,
-#                    help="HF dataset config name")
-#     p.add_argument("--train-split",    default="train",
-#                    help="split or slice, e.g. 'train', 'train[:1%]'")
-#     p.add_argument("--out",            required=True)
-#     p.add_argument("--device",         choices=["cpu", "gpu"], default="gpu")
-#     p.add_argument("--resume")
-#     return p.parse_args()
-
-
-# download_config = DownloadConfig(max_retries=5)   # retryable downloads
-
-
-# # ─────────────────────────── main ──────────────────────────────
-# def main():
-#     group = mx.distributed.init()
-#     rank, size = group.rank(), group.size()
-#     print(f"[Rank {rank}] launcher OK ({rank+1}/{size})", flush=True)
-
-#     args = get_args()
-#     mx.set_default_device(mx.gpu if args.device == "gpu" else mx.cpu)
-
-#     # config & tokenizer
-#     cfg = SMLMConfig.from_json(args.config)
-#     sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
-#     pad_id = sp.piece_to_id("<pad>") if sp.piece_to_id("<pad>") >= 0 else -100
-
-#     # per-GPU micro-batch
-#     LOCAL_BS    = 4
-#     ACCUM_STEPS = 16
-
-#     # streaming dataset load & preprocess
-#     for attempt in range(1, 6):
-#         try:
-#             time.sleep(5)
-#             print(f"[Rank {rank}] load_dataset try {attempt}/5 …", flush=True)
-#             ds = load_dataset(
-#                 args.dataset,
-#                 args.dataset_config,
-#                 split=args.train_split,
-#                 streaming=True,
-#                 download_config=download_config,
-#                 trust_remote_code=True,
-#             )
-#             print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
-#             break
-#         except Exception as e:
-#             print(f"[Rank {rank}] ⚠️ load_dataset failed: {e!r}", flush=True)
-#             if attempt == 5:
-#                 raise
-#             time.sleep(5)
-
-#     ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-#     ds = ds.shard(num_shards=size, index=rank, contiguous=True)
-#     ds = ds.shuffle(seed=42 + rank)
-
-#     # ─── offset handling (FIXED) ─────────────────────────────────
-#     out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
-#     offset_file = out_dir / "offset.txt"
-#     if offset_file.exists():
-#         raw = offset_file.read_text().strip()
-#         try:
-#             offset = int(raw) if raw else 0
-#         except ValueError:
-#             print(f"[Rank {rank}] ⚠️ invalid offset content {raw!r}, resetting to 0", flush=True)
-#             offset = 0
-#     else:
-#         offset = 0
-#     print(f"[Rank {rank}] skipping first {offset:,} global tokens", flush=True)
-
-#     tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
-#     rank_offset_tokens = offset // size
-#     skip_batches = rank_offset_tokens // tokens_per_rank_mb
-#     train_it = itertools.islice(
-#         sample_generator(ds, cfg.context_size, LOCAL_BS),
-#         skip_batches,
-#         None
-#     )
-
-#     model = OpenELM(cfg)
-#     opt   = optim.AdamW(cfg.max_lr, betas=(0.9, .98), eps=1e-8,
-#                         weight_decay=cfg.weight_decay)
-#     if cfg.torch_dtype == "bfloat16" and hasattr(mx, "set_default_dtype"):
-#         mx.set_default_dtype(mx.bfloat16)
-
-#     start_step = 0
-#     if args.resume and rank == 0:
-#         model.load_weights(args.resume)
-#         try:
-#             start_step = int(pathlib.Path(args.resume).stem.split("_")[-1])
-#         except ValueError:
-#             pass
-#         print(f"[Rank 0] resumed from {args.resume}", flush=True)
-
-#     _barrier()
-#     _broadcast_params(model.parameters(), rank)
-#     print(f"[Rank {rank}] weights synced – entering loop (local_bs={LOCAL_BS})", flush=True)
-
-#     if rank == 0:
-#         wandb.init(
-#           project="fineweb-pretrain",
-#           config={**cfg.__dict__, "LOCAL_BS": LOCAL_BS, "ACCUM_STEPS": ACCUM_STEPS, "world_size": size},
-#           name=f"pretrain-{start_step:06d}"
-#         )
-
-#     # stable loss fn (with epsilon)
-#     def loss_fn(m, batch):
-#         x, y = batch[:, :-1], batch[:, 1:]
-#         logits = m(x)
-#         if pad_id >= 0:
-#             valid = (y != pad_id).astype(mx.float32)
-#             valid_sum = valid.sum()
-#         else:
-#             valid = mx.ones_like(y, dtype=mx.float32)
-#             valid_sum = float(y.size)  # fallback
-#         ce = losses.cross_entropy(
-#             logits.reshape(-1, cfg.vocab_size),
-#             y.reshape(-1),
-#             reduction="none",
-#         ).reshape(*y.shape)
-#         loss = (ce * valid).sum() / (valid_sum + 1e-6)
-#         return loss
-
-#     value_and_grad = nn.value_and_grad(model, loss_fn)
-#     # warm-up compile
-#     _ = value_and_grad(model, mx.array(np.zeros((1, 4), dtype=np.int32))); mx.eval(_)
-
-#     def compute_grad_norm(tree) -> float:
-#         flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
-#         total = math.sqrt(sum(float((g**2).sum()) for g in flats))
-#         return total
-
-#     acc_l = acc_s = 0
-#     accum_grads = None
-#     micro_step  = 0
-#     RESTART_WARM = 10000
-
-#     for global_step in range(start_step + 1, cfg.max_iterations + 1):
-
-#         # LR schedule (restart warm + cosine)
-#         if global_step < start_step + RESTART_WARM:
-#             opt.learning_rate = cfg.max_lr * (global_step - start_step) / RESTART_WARM
-#         else:
-#             opt.learning_rate = cosine_lr(
-#                 global_step, base=cfg.max_lr,
-#                 warmup=cfg.warmup_iterations,
-#                 total=cfg.max_iterations,
-#                 min_lr=cfg.min_lr,
-#             )
-
-#         # fetch batch and compute loss+grads
-#         batch = next(train_it)
-#         loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
-
-#         # diagnostic on NaN/Inf
-#         if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
-#             if rank == 0:
-#                 x, y = batch[:, :-1], batch[:, 1:]
-#                 valid = (y != pad_id).astype(mx.float32) if pad_id >= 0 else mx.ones_like(y, dtype=mx.float32)
-#                 valid_sum = valid.sum()
-#                 print(f"[{global_step}] ⚠️ NaN/Inf loss detected. valid_sum={valid_sum}", flush=True)
-#             # skip this micro-step to avoid corrupting accumulation
-#             continue
-
-#         # scale per-micro-step for accumulation
-#         grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
-#         accum_grads = grads if accum_grads is None else tree_map(
-#             lambda a, g: a + g if isinstance(a, mx.array) else a, accum_grads, grads)
-#         micro_step += 1
-
-#         if micro_step == ACCUM_STEPS:
-#             # aggregate across ranks
-#             global_grads = tree_map(lambda g: mx.distributed.all_sum(g), accum_grads)
-#             # compute gradient norm before clipping
-#             grad_norm = compute_grad_norm(global_grads)
-#             # clip
-#             clipped = clip_global(global_grads, cfg.grad_clip)
-#             # update
-#             opt.update(model, clipped); mx.eval(model.parameters())
-
-#             accum_grads = None; micro_step = 0
-
-#             # ─── checkpoint & offset bookkeeping ──────────────
-#             if rank == 0 and global_step % 5000 == 0:
-#                 ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
-#                 model.save_weights(str(ckpt_path))
-#                 processed = global_step * (size * LOCAL_BS * (cfg.context_size + 1))
-#                 offset_file.write_text(str(processed))
-#                 print(f"[{global_step}] ✔ saved {ckpt_path.name} | offset={processed:,}", flush=True)
-
-#             acc_l += float(loss); acc_s += 1
-#             if global_step % 10 == 0 and rank == 0:
-#                 avg_loss = acc_l / acc_s
-#                 perp = math.exp(avg_loss)
-#                 print(f"[{global_step}/{cfg.max_iterations}] loss={avg_loss:.3f} perplexity={perp:.2f} lr={opt.learning_rate:.2e} grad_norm={grad_norm:.3f}", flush=True)
-
-#                 wandb.log({
-#                     "train/loss":       float(avg_loss),
-#                     "train/perplexity": float(perp),
-#                     "train/lr":         float(opt.learning_rate),
-#                     "train/grad_norm":  float(grad_norm),
-#                 }, step=int(global_step))
-#                 acc_l = acc_s = 0
-
-#     if rank == 0:
-#         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
-#         offset_file.write_text(str(cfg.max_iterations * (size * LOCAL_BS * (cfg.context_size + 1))))
-#         print("✅ Training complete", flush=True)
-
-
-# if __name__ == "__main__":
-#     main()
-
-
 # model/train.py
-# MLX distributed trainer (ring) with fp16 stability, accumulation, all-reduce, clip,
-# streaming FineWeb packing, W&B logging, and a cosine LR after a short warm restart.
+# MLX distributed trainer (ring) with loud, timestamped logging.
+# Highlights:
+#  - Logs around distributed init, device/dtype, tokenizer, dataset streaming, compile.
+#  - Periodic updates with loss/ppl, lr, grad-norm, updates/s, tokens/s.
+#  - fp16/bf16-safe: attention + CE computed in fp32.
+#  - Gradient accumulation + all-reduce + clip, offset resume, W&B logging.
 
 from __future__ import annotations
 import argparse, pathlib, math, json, time, itertools, socket, os
@@ -310,10 +23,15 @@ import wandb
 
 from .model import OpenELM, SMLMConfig
 
+# ───────────────────────────────────
+# tiny logger
+def log(rank, *msg):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [Rank {rank}]", *msg, flush=True)
 
+# ───────────────────────────────────
 def _barrier() -> None:
     mx.eval(mx.distributed.all_sum(mx.array([1], dtype=mx.int32)))
-
 
 def _broadcast_params(params, rank: int) -> None:
     # poor-man's broadcast: zero on non-root, sum-reduce
@@ -324,11 +42,9 @@ def _broadcast_params(params, rank: int) -> None:
             p[...] = 0
         p[...] = mx.distributed.all_sum(p)
 
-
 def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: str):
     ids = sp.encode(example[key], out_type=int, add_bos=True, add_eos=True)
     return {"ids": ids}
-
 
 def sample_generator(dataset: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
     """Packs a streaming dataset into windows of length ctx+1 for LM training."""
@@ -341,13 +57,11 @@ def sample_generator(dataset: Iterator[Dict[str, Any]], ctx: int, bs: int) -> It
                 del buf[: window * bs]
                 yield mx.array(chunk).reshape(bs, window)
 
-
 def cosine_lr(step, *, base, warmup, total, min_lr):
     if step < warmup:
         return base * step / max(1, warmup)
     t = (step - warmup) / max(1, total - warmup)
     return min_lr + 0.5 * (base - min_lr) * (1 + math.cos(math.pi * t))
-
 
 def clip_global(tree, max_norm):
     flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
@@ -356,7 +70,6 @@ def clip_global(tree, max_norm):
         return tree
     scale = max_norm / (total + 1e-6)
     return tree_map(lambda x: x * scale if isinstance(x, mx.array) else x, tree)
-
 
 def get_args():
     p = argparse.ArgumentParser("OpenSML MLX trainer")
@@ -370,12 +83,13 @@ def get_args():
     p.add_argument("--resume")
     return p.parse_args()
 
-
+# ───────────────────────────────────
 def main():
     print(f"[BOOT] host={socket.gethostname()} rank_env={os.getenv('MLX_RANK')}")
+    log(-1, "starting distributed init; MLX_HOSTS=", os.getenv("MLX_HOSTS"), "MLX_PORT=", os.getenv("MLX_PORT"))
     group = mx.distributed.init()
     rank, size = group.rank(), group.size()
-    print(f"[Rank {rank}] launcher OK ({rank+1}/{size})", flush=True)
+    log(rank, f"init OK ({rank+1}/{size}) on host {socket.gethostname()}")
 
     args = get_args()
     cfg = SMLMConfig.from_json(args.config)
@@ -387,26 +101,35 @@ def main():
             mx.set_default_dtype(mx.float16)
         elif cfg.torch_dtype == "bfloat16":
             mx.set_default_dtype(mx.bfloat16)
+    # best-effort print of default dtype
+    try:
+        default_dtype = mx.default_dtype()
+    except Exception:
+        default_dtype = "n/a"
+    log(rank, f"device={'gpu' if args.device=='gpu' else 'cpu'} default_dtype={default_dtype}")
 
     # tokenizer + vocab sanity
+    log(rank, f"loading tokenizer: {args.tokenizer}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
     vocab_from_sp = int(sp.get_piece_size())
     if cfg.vocab_size != vocab_from_sp:
-        # keep model + head aligned with tokenizer to avoid OOB ids
         cfg.vocab_size = vocab_from_sp
+        log(rank, f"vocab_size adjusted to tokenizer size: {cfg.vocab_size}")
     pad_tok = sp.piece_to_id("<pad>")
-    pad_id = pad_tok if pad_tok >= 0 else -100  # -100 => no real pad token; we'll treat all tokens as valid
+    pad_id = pad_tok if pad_tok >= 0 else -100
+    log(rank, f"tokenizer loaded. vocab={vocab_from_sp} pad_id={pad_tok}")
 
     # micro-batch & accumulation (can override via env)
     LOCAL_BS = int(os.getenv("LOCAL_BS", cfg.local_bs))
     ACCUM_STEPS = int(os.getenv("ACCUM_STEPS", cfg.accum_steps))
+    SHUFFLE_BUF = int(os.getenv("SHUFFLE_BUFFER", 20000))
+    log(rank, f"LOCAL_BS={LOCAL_BS} ACCUM_STEPS={ACCUM_STEPS} SHUFFLE_BUFFER={SHUFFLE_BUF} context={cfg.context_size}")
 
     # streaming dataset
     download_config = DownloadConfig(max_retries=5)
     for attempt in range(1, 6):
         try:
-            time.sleep(3)
-            print(f"[Rank {rank}] load_dataset try {attempt}/5 …", flush=True)
+            log(rank, f"loading dataset {args.dataset} cfg={args.dataset_config} split={args.train_split} (streaming=True) try {attempt}/5")
             ds = load_dataset(
                 args.dataset,
                 args.dataset_config,
@@ -415,17 +138,18 @@ def main():
                 download_config=download_config,
                 trust_remote_code=True,
             )
-            print(f"[Rank {rank}] ✔ load_dataset complete", flush=True)
+            log(rank, "dataset stream acquired")
             break
         except Exception as e:
-            print(f"[Rank {rank}] ⚠️ load_dataset failed: {e!r}", flush=True)
+            log(rank, f"load_dataset failed: {e!r}")
             if attempt == 5:
                 raise
             time.sleep(5)
 
     ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
     ds = ds.shard(num_shards=size, index=rank, contiguous=True)
-    ds = ds.shuffle(seed=42 + rank)
+    ds = ds.shuffle(seed=42 + rank, buffer_size=SHUFFLE_BUF)
+    log(rank, "dataset mapped/sharded/shuffled; building packer")
 
     # offset handling for restarts
     out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
@@ -437,7 +161,7 @@ def main():
             offset = 0
     else:
         offset = 0
-    print(f"[Rank {rank}] skipping first {offset:,} global tokens", flush=True)
+    log(rank, f"skipping first {offset:,} global tokens (if any)")
 
     tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
     rank_offset_tokens = offset // size
@@ -447,6 +171,7 @@ def main():
         skip_batches,
         None
     )
+    log(rank, f"packer ready. skip_batches={skip_batches}")
 
     # model + optimizer
     model = OpenELM(cfg)
@@ -454,25 +179,19 @@ def main():
 
     start_step = 0
     if args.resume and rank == 0:
-        model.load_weights(args.resume)
-        meta = out_dir / "meta.json"
-        if meta.exists():
-            try:
+        try:
+            model.load_weights(args.resume)
+            meta = out_dir / "meta.json"
+            if meta.exists():
                 start_step = json.loads(meta.read_text()).get("global_step", 0)
-            except Exception:
-                start_step = 0
+            log(rank, f"resumed from {args.resume} at step {start_step}")
+        except Exception as e:
+            log(rank, f"resume failed: {e!r}")
 
     # broadcast params
     _barrier()
     _broadcast_params(model.parameters(), rank)
-    print(f"[Rank {rank}] weights synced – entering loop (local_bs={LOCAL_BS})", flush=True)
-
-    if rank == 0:
-        wandb.init(
-            project="fineweb-pretrain",
-            config={**cfg.__dict__, "LOCAL_BS": LOCAL_BS, "ACCUM_STEPS": ACCUM_STEPS, "world_size": size},
-            name=f"pretrain-{start_step:06d}",
-        )
+    log(rank, f"weights synced – entering compile")
 
     # numerically-stable loss (logits upcast to fp32)
     def loss_fn(m, batch):
@@ -495,7 +214,16 @@ def main():
     value_and_grad = nn.value_and_grad(model, loss_fn)
 
     # warm-up compile
+    log(rank, "warming up compile for value_and_grad() …")
     _ = value_and_grad(model, mx.array(np.zeros((1, 4), dtype=np.int32))); mx.eval(_)
+    log(rank, "compile done; starting training loop")
+
+    if rank == 0:
+        wandb.init(
+            project="fineweb-pretrain",
+            config={**cfg.__dict__, "LOCAL_BS": LOCAL_BS, "ACCUM_STEPS": ACCUM_STEPS, "world_size": size},
+            name=f"pretrain-{start_step:06d}",
+        )
 
     def compute_grad_norm(tree) -> float:
         flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
@@ -505,6 +233,11 @@ def main():
     accum_grads = None
     micro_step = 0
     RESTART_WARM = 10_000  # short warm restart for smoother convergence after resume
+
+    # throughput accounting
+    toks_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
+    last_log_t = time.time()
+    log(rank, f"effective tokens/update ≈ {toks_per_update:,}")
 
     for global_step in range(start_step + 1, cfg.max_iterations + 1):
         # LR schedule
@@ -518,6 +251,7 @@ def main():
                 min_lr=cfg.min_lr,
             )
 
+        # fetch batch and compute loss+grads
         batch = next(train_it)
         loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
 
@@ -525,11 +259,8 @@ def main():
         if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
             if rank == 0:
                 x, y = batch[:, :-1], batch[:, 1:]
-                if pad_id >= 0:
-                    valid = (y != pad_id).astype(mx.float32); valid_sum = valid.sum()
-                else:
-                    valid_sum = float(y.size)
-                print(f"[{global_step}] ⚠️ NaN/Inf loss detected. valid_sum={valid_sum}", flush=True)
+                valid_sum = (y != pad_id).sum() if pad_id >= 0 else y.size
+                log(rank, f"⚠️ NaN/Inf loss detected. valid_sum={valid_sum}")
             continue
 
         # scale for accumulation
@@ -553,35 +284,48 @@ def main():
             opt.update(model, global_grads); mx.eval(model.parameters())
             accum_grads = None; micro_step = 0
 
-            # logging & checkpoints
-            if rank == 0 and (global_step % 5000 == 0):
-                ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
-                model.save_weights(str(ckpt_path))
-                (out_dir / "meta.json").write_text(json.dumps({"global_step": int(global_step)}))
-                processed = global_step * (size * LOCAL_BS * (cfg.context_size + 1))
-                (out_dir / "offset.txt").write_text(str(processed))
-                print(f"[{global_step}] ✔ saved {ckpt_path.name} | offset={processed:,}", flush=True)
-
             acc_l += float(loss); acc_s += 1
-            if global_step % 10 == 0 and rank == 0:
-                avg_loss = acc_l / max(1, acc_s)
-                ppl = math.exp(avg_loss)
-                print(f"[{global_step}/{cfg.max_iterations}] loss={avg_loss:.4f} ppl={ppl:.2f} "
-                      f"lr={opt.learning_rate:.2e} grad_norm={grad_norm:.3f}", flush=True)
-                wandb.log({
-                    "train/loss": float(avg_loss),
-                    "train/perplexity": float(ppl),
-                    "train/lr": float(opt.learning_rate),
-                    "train/grad_norm": float(grad_norm),
-                }, step=int(global_step))
-                acc_l = acc_s = 0
+
+            # logging & checkpoints
+            if rank == 0:
+                now = time.time()
+                if global_step % 10 == 0:
+                    avg_loss = acc_l / max(1, acc_s)
+                    ppl = math.exp(avg_loss)
+                    dt = max(1e-6, now - last_log_t)
+                    updates_per_sec = 10.0 / dt
+                    tokens_per_sec = updates_per_sec * toks_per_update
+                    last_log_t = now
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [Rank 0] "
+                        f"step={global_step} loss={avg_loss:.4f} ppl={ppl:.2f} "
+                        f"lr={opt.learning_rate:.2e} grad_norm={grad_norm:.3f} "
+                        f"updates/s={updates_per_sec:.2f} tokens/s≈{tokens_per_sec:,.0f}",
+                        flush=True
+                    )
+                    wandb.log({
+                        "train/loss": float(avg_loss),
+                        "train/perplexity": float(ppl),
+                        "train/lr": float(opt.learning_rate),
+                        "train/grad_norm": float(grad_norm),
+                        "train/updates_per_sec": float(updates_per_sec),
+                        "train/tokens_per_sec": float(tokens_per_sec),
+                    }, step=int(global_step))
+                    acc_l = acc_s = 0
+
+                if global_step % 5000 == 0:
+                    ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
+                    model.save_weights(str(ckpt_path))
+                    (out_dir / "meta.json").write_text(json.dumps({"global_step": int(global_step)}))
+                    processed = global_step * (size * LOCAL_BS * (cfg.context_size + 1))
+                    (out_dir / "offset.txt").write_text(str(processed))
+                    log(rank, f"✔ saved {ckpt_path.name} | offset={processed:,}")
 
     if rank == 0:
         model.save_weights(str(out_dir / "ckpt_final.safetensors"))
         final_offset = cfg.max_iterations * (size * LOCAL_BS * (cfg.context_size + 1))
         (out_dir / "offset.txt").write_text(str(final_offset))
-        print("✅ Training complete", flush=True)
-
+        log(rank, "✅ Training complete")
 
 if __name__ == "__main__":
     main()
