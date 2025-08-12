@@ -4,10 +4,13 @@
 # - rank-staggered start to spread out Hub load
 # - optional HF token login to increase Hub rate limit
 # - fp16/bf16-safe (attention + CE in fp32), grad accumulation, all-reduce, clip
+# - AUTO-RESUME from latest ckpt if --resume not given
+# - FLUSH-ON-EXIT: save meta/offset (+ autosave ckpt) on Ctrl-C / SIGTERM / exceptions
 
 from __future__ import annotations
-import argparse, pathlib, math, json, time, itertools, socket, os, random
+import argparse, pathlib, math, json, time, itertools, socket, os, random, signal
 from typing import Iterator, Dict, Any
+from collections.abc import Mapping, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -36,6 +39,19 @@ def log(rank, *msg):
     print(f"[{ts}] [Rank {rank}]", *msg, flush=True)
 
 # ───────────────────────────────────
+def _flatten(tree):
+    if isinstance(tree, mx.array):
+        return [tree]
+    if isinstance(tree, Mapping):
+        out = []
+        for v in tree.values(): out += _flatten(v)
+        return out
+    if isinstance(tree, Sequence) and not isinstance(tree, (str, bytes)):
+        out = []
+        for v in tree: out += _flatten(v)
+        return out
+    return []
+
 def _barrier() -> None:
     mx.eval(mx.distributed.all_sum(mx.array([1], dtype=mx.int32)))
 
@@ -69,16 +85,13 @@ def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
                 time.sleep(sleep_for)
                 backoff = min(backoff * 2.0, backoff_max)
                 continue
-            # Retry some other transient classes, too
             if code in {500, 502, 503, 504, None}:
                 sleep_for = 5.0 * (1.0 + 0.5 * random.random())
                 log(rank, f"HF transient {code or 'error'} → backoff {sleep_for:.1f}s")
                 time.sleep(sleep_for)
                 continue
-            # otherwise bubble up
             raise
         except Exception as e:
-            # Generic network hiccup
             sleep_for = 5.0 * (1.0 + 0.5 * random.random())
             log(rank, f"dataset iterator error: {type(e).__name__}: {e} → retry in {sleep_for:.1f}s")
             time.sleep(sleep_for)
@@ -206,9 +219,24 @@ def main():
     ds = ds.shuffle(seed=42 + rank, buffer_size=SHUFFLE_BUF)
     log(rank, "dataset mapped/sharded/shuffled; building packer")
 
-    # offset handling for restarts
+    # output dir & resume helpers
     out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = out_dir / "meta.json"
     offset_file = out_dir / "offset.txt"
+
+    def find_latest_ckpt(p: pathlib.Path):
+        cands = list(p.glob("ckpt_*.safetensors"))
+        if not cands:
+            return None, 0
+        def step_of(fp: pathlib.Path):
+            try:
+                return int(fp.stem.split("_")[-1])
+            except Exception:
+                return 0
+        latest = max(cands, key=step_of)
+        return latest, step_of(latest)
+
+    # offset handling for restarts (data position)
     if offset_file.exists():
         try:
             offset = int(offset_file.read_text().strip() or "0")
@@ -219,12 +247,12 @@ def main():
     log(rank, f"skipping first {offset:,} global tokens (if any)")
 
     tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
+    rank, size = rank, size
     rank_offset_tokens = offset // size
     skip_batches = rank_offset_tokens // tokens_per_rank_mb
 
     # Wrap the dataset with our resilient iterator to survive 429s
     ds_iter = resilient_dataset_iter(ds, rank, backoff_max=BACKOFF_MAX)
-
     train_it = itertools.islice(
         sample_generator(ds_iter, cfg.context_size, LOCAL_BS),
         skip_batches,
@@ -236,21 +264,35 @@ def main():
     model = OpenELM(cfg)
     opt = optim.AdamW(cfg.max_lr, betas=(0.9, 0.98), eps=1e-8, weight_decay=cfg.weight_decay)
 
+    # resume logic
     start_step = 0
+    loaded_ckpt_step = 0
     if args.resume and rank == 0:
         try:
             model.load_weights(args.resume)
-            meta = out_dir / "meta.json"
-            if meta.exists():
-                start_step = json.loads(meta.read_text()).get("global_step", 0)
-            log(rank, f"resumed from {args.resume} at step {start_step}")
+            loaded_ckpt_step = 0
+            if meta_path.exists():
+                loaded_ckpt_step = int(json.loads(meta_path.read_text()).get("global_step", 0))
+            log(rank, f"resumed from --resume {args.resume} at step {loaded_ckpt_step}")
         except Exception as e:
             log(rank, f"resume failed: {e!r}")
+    elif not args.resume and rank == 0:
+        ckpt, ckpt_step = find_latest_ckpt(out_dir)
+        if ckpt is not None:
+            try:
+                model.load_weights(str(ckpt))
+                loaded_ckpt_step = ckpt_step
+                log(rank, f"auto-resume from {ckpt.name} (step {ckpt_step})")
+            except Exception as e:
+                log(rank, f"auto-resume load failed: {e!r}")
 
-    # broadcast params
+    # choose start_step: prefer the weights' step; ignore meta if it's ahead of ckpt
+    start_step = int(loaded_ckpt_step)
+
+    # broadcast params after any resume
     _barrier()
     _broadcast_params(model.parameters(), rank)
-    log(rank, f"weights synced – entering compile")
+    log(rank, f"weights synced – entering compile (start_step={start_step})")
 
     # numerically-stable loss (logits upcast to fp32)
     def loss_fn(m, batch):
@@ -285,106 +327,135 @@ def main():
         )
 
     def compute_grad_norm(tree) -> float:
-        flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
-        return math.sqrt(sum(float((g**2).sum()) for g in flats)) if flats else 0.0
+        flats = [g for g in _flatten(tree) if isinstance(g, mx.array)]
+        return (sum(float((g**2).sum()) for g in flats) ** 0.5) if flats else 0.0
 
     acc_l = acc_s = 0
     accum_grads = None
     micro_step = 0
     RESTART_WARM = 10_000  # short warm restart
-
-    # throughput accounting
     toks_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
     last_log_t = time.time()
     log(rank, f"effective tokens/update ≈ {toks_per_update:,}")
 
-    for global_step in range(start_step + 1, cfg.max_iterations + 1):
-        # LR schedule
-        if global_step < start_step + RESTART_WARM:
-            opt.learning_rate = cfg.max_lr * (global_step - start_step) / max(1, RESTART_WARM)
-        else:
-            opt.learning_rate = cosine_lr(
-                global_step, base=cfg.max_lr,
-                warmup=cfg.warmup_iterations,
-                total=cfg.max_iterations,
-                min_lr=cfg.min_lr,
-            )
-
-        # fetch batch and compute loss+grads
-        batch = next(train_it)
-        loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
-
-        # detect/skip NaN loss to keep accumulation clean
-        if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
-            if rank == 0:
-                x, y = batch[:, :-1], batch[:, 1:]
-                valid_sum = (y != pad_id).sum() if pad_id >= 0 else y.size
-                log(rank, f"⚠️ NaN/Inf loss detected. valid_sum={valid_sum}")
-            continue
-
-        # scale for accumulation
-        grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
-        accum_grads = grads if accum_grads is None else tree_map(
-            lambda a, g: a + g if isinstance(a, mx.array) else a, accum_grads, grads
-        )
-        micro_step += 1
-
-        if micro_step == ACCUM_STEPS:
-            # all-reduce grads
-            global_grads = tree_map(lambda g: mx.distributed.all_sum(g), accum_grads)
-            grad_norm = compute_grad_norm(global_grads)
-            # clean & clip
-            global_grads = tree_map(
-                lambda g: mx.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4) if isinstance(g, mx.array) else g,
-                global_grads
-            )
-            global_grads = clip_global(global_grads, cfg.grad_clip)
-            # apply
-            opt.update(model, global_grads); mx.eval(model.parameters())
-            accum_grads = None; micro_step = 0
-
-            acc_l += float(loss); acc_s += 1
-
-            # logging & checkpoints
-            if rank == 0:
-                now = time.time()
-                if global_step % 10 == 0:
-                    avg_loss = acc_l / max(1, acc_s)
-                    ppl = math.exp(avg_loss)
-                    dt = max(1e-6, now - last_log_t)
-                    updates_per_sec = 10.0 / dt
-                    tokens_per_sec = updates_per_sec * toks_per_update
-                    last_log_t = now
-                    print(
-                        f"[{time.strftime('%H:%M:%S')}] [Rank 0] "
-                        f"step={global_step} loss={avg_loss:.4f} ppl={ppl:.2f} "
-                        f"lr={opt.learning_rate:.2e} grad_norm={grad_norm:.3f} "
-                        f"updates/s={updates_per_sec:.2f} tokens/s≈{tokens_per_sec:,.0f}",
-                        flush=True
-                    )
-                    wandb.log({
-                        "train/loss": float(avg_loss),
-                        "train/perplexity": float(ppl),
-                        "train/lr": float(opt.learning_rate),
-                        "train/grad_norm": float(grad_norm),
-                        "train/updates_per_sec": float(updates_per_sec),
-                        "train/tokens_per_sec": float(tokens_per_sec),
-                    }, step=int(global_step))
-                    acc_l = acc_s = 0
-
-                if global_step % 5000 == 0:
-                    ckpt_path = out_dir / f"ckpt_{global_step:06d}.safetensors"
-                    model.save_weights(str(ckpt_path))
-                    (out_dir / "meta.json").write_text(json.dumps({"global_step": int(global_step)}))
-                    processed = global_step * (size * LOCAL_BS * (cfg.context_size + 1))
-                    (out_dir / "offset.txt").write_text(str(processed))
-                    log(rank, f"✔ saved {ckpt_path.name} | offset={processed:,}")
-
+    # graceful shutdown: capture SIGINT/SIGTERM and save
+    stop_flag = {"stop": False}
+    def _handle(sig, _frame):
+        stop_flag["stop"] = True
+        log(rank, f"received signal {sig}; will save & exit after this update…")
     if rank == 0:
-        model.save_weights(str(out_dir / "ckpt_final.safetensors"))
-        final_offset = cfg.max_iterations * (size * LOCAL_BS * (cfg.context_size + 1))
-        (out_dir / "offset.txt").write_text(str(final_offset))
-        log(rank, "✅ Training complete")
+        signal.signal(signal.SIGINT, _handle)
+        signal.signal(signal.SIGTERM, _handle)
+
+    # helper to persist state (ckpt + meta + offset)
+    def save_state(step: int, tag: str | None = None):
+        if rank != 0:
+            return
+        name = f"ckpt_{step:06d}.safetensors" if not tag else f"ckpt_{step:06d}_{tag}.safetensors"
+        ckpt_path = out_dir / name
+        try:
+            model.save_weights(str(ckpt_path))
+        except Exception as e:
+            log(rank, f"checkpoint save failed: {e!r}")
+        try:
+            (meta_path).write_text(json.dumps({"global_step": int(step)}))
+            processed = step * (size * LOCAL_BS * (cfg.context_size + 1))
+            (offset_file).write_text(str(processed))
+            log(rank, f"💾 saved {ckpt_path.name} | offset={processed:,}")
+        except Exception as e:
+            log(rank, f"meta/offset save failed: {e!r}")
+
+    last_completed_step = start_step
+
+    try:
+        for global_step in range(start_step + 1, cfg.max_iterations + 1):
+            # LR schedule
+            if global_step < start_step + RESTART_WARM:
+                opt.learning_rate = cfg.max_lr * (global_step - start_step) / max(1, RESTART_WARM)
+            else:
+                opt.learning_rate = cosine_lr(
+                    global_step, base=cfg.max_lr,
+                    warmup=cfg.warmup_iterations,
+                    total=cfg.max_iterations,
+                    min_lr=cfg.min_lr,
+                )
+
+            # fetch batch and compute loss+grads
+            batch = next(train_it)
+            loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
+
+            # detect/skip NaN loss to keep accumulation clean
+            if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
+                if rank == 0:
+                    x, y = batch[:, :-1], batch[:, 1:]
+                    valid_sum = (y != pad_id).sum() if pad_id >= 0 else y.size
+                    log(rank, f"⚠️ NaN/Inf loss detected. valid_sum={valid_sum}")
+                continue
+
+            # scale for accumulation
+            grads = tree_map(lambda g: g / ACCUM_STEPS if isinstance(g, mx.array) else g, grads)
+            accum_grads = grads if accum_grads is None else tree_map(
+                lambda a, g: a + g if isinstance(a, mx.array) else a, accum_grads, grads
+            )
+            micro_step += 1
+
+            if micro_step == ACCUM_STEPS:
+                # all-reduce grads
+                global_grads = tree_map(lambda g: mx.distributed.all_sum(g), accum_grads)
+                grad_norm = compute_grad_norm(global_grads)
+                # clean & clip
+                global_grads = tree_map(
+                    lambda g: mx.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4) if isinstance(g, mx.array) else g,
+                    global_grads
+                )
+                global_grads = clip_global(global_grads, cfg.grad_clip)
+                # apply
+                opt.update(model, global_grads); mx.eval(model.parameters())
+                accum_grads = None; micro_step = 0
+
+                acc_l += float(loss); acc_s += 1
+                last_completed_step = global_step  # for safe resume
+
+                # logging & checkpoints
+                if rank == 0:
+                    now = time.time()
+                    if global_step % 10 == 0:
+                        avg_loss = acc_l / max(1, acc_s)
+                        ppl = math.exp(avg_loss)
+                        dt = max(1e-6, now - last_log_t)
+                        updates_per_sec = 10.0 / dt
+                        tokens_per_sec = updates_per_sec * toks_per_update
+                        last_log_t = now
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] [Rank 0] "
+                            f"step={global_step} loss={avg_loss:.4f} ppl={ppl:.2f} "
+                            f"lr={opt.learning_rate:.2e} grad_norm={grad_norm:.3f} "
+                            f"updates/s={updates_per_sec:.2f} tokens/s≈{tokens_per_sec:,.0f}",
+                            flush=True
+                        )
+                        wandb.log({
+                            "train/loss": float(avg_loss),
+                            "train/perplexity": float(ppl),
+                            "train/lr": float(opt.learning_rate),
+                            "train/grad_norm": float(grad_norm),
+                            "train/updates_per_sec": float(updates_per_sec),
+                            "train/tokens_per_sec": float(tokens_per_sec),
+                        }, step=int(global_step))
+                        acc_l = acc_s = 0
+
+                    if global_step % 5000 == 0:
+                        save_state(global_step, tag=None)
+
+                # stop requested → autosave and exit cleanly
+                if stop_flag["stop"]:
+                    save_state(last_completed_step, tag="autosave")
+                    break
+
+    finally:
+        # Always flush meta/offset; also write a lightweight autosave ckpt
+        save_state(last_completed_step, tag="finalize")
+        if rank == 0:
+            log(rank, "✅ State flushed on exit")
 
 if __name__ == "__main__":
     main()
