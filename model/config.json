@@ -12,11 +12,11 @@
   "ffn_with_glu": true,
 
   "rope_freq_constant": 10000,
-  "rope_max_length": 2048,
+  "rope_max_length": 512,
   "normalization_layer_name": "rmsnorm",
   "activation_fn_name": "silu",
 
-  "context_size": 2048,
+  "context_size": 512,
   "dropout": 0.0,
 
   "max_iterations": 1000000,
