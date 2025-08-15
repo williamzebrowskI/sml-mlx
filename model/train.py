@@ -316,7 +316,8 @@ def main():
 
     # warm-up compile
     log(rank, "warming up compile for value_and_grad() …")
-    _ = value_and_grad(model, mx.array(np.zeros((1, 4), dtype=np.int32))); mx.eval(_)
+    _dummy = mx.array(np.zeros((LOCAL_BS, cfg.context_size + 1), dtype=np.int32))
+    _ = value_and_grad(model, _dummy); mx.eval(_)
     log(rank, "compile done; starting training loop")
 
     if rank == 0:
