@@ -25,10 +25,10 @@ class SMLMConfig:
     ffn_dim_divisor: int = 256
     ffn_with_glu: bool = True
     rope_freq_constant: int = 10000
-    rope_max_length: int = 2048
+    rope_max_length: int = 512
     normalization_layer_name: str = "rmsnorm"
     activation_fn_name: str = "silu"
-    context_size: int = 2048
+    context_size: int = 512
     share_input_output_layers: bool = True
     use_fast_sdp: bool = True      # NEW: fused SDPA toggle
     dropout: float = 0.0
@@ -41,8 +41,8 @@ class SMLMConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     torch_dtype: str = "float16"  # or "bfloat16"
-    local_bs: int = 4
-    accum_steps: int = 16
+    local_bs: int = 2
+    accum_steps: int = 8
 
     # optional metadata
     tokenizer_path: str = ""
@@ -64,10 +64,10 @@ class SMLMConfig:
             ffn_dim_divisor=int(raw.get("ffn_dim_divisor", 256)),
             ffn_with_glu=bool(raw.get("ffn_with_glu", True)),
             rope_freq_constant=int(raw.get("rope_freq_constant", 10000)),
-            rope_max_length=int(raw.get("rope_max_length", raw.get("context_size", 2048))),
+            rope_max_length=int(raw.get("rope_max_length", raw.get("context_size", 512))),
             normalization_layer_name=str(raw.get("normalization_layer_name", "rmsnorm")).replace("rms_norm", "rmsnorm"),
             activation_fn_name=str(raw.get("activation_fn_name", "silu")).replace("swish", "silu"),
-            context_size=int(raw.get("context_size", 2048)),
+            context_size=int(raw.get("context_size", 512)),
             share_input_output_layers=bool(raw.get("share_input_output_layers", True)),
             use_fast_sdp=bool(raw.get("use_fast_sdp", True)),  # NEW
             dropout=float(raw.get("dropout", 0.0)),
