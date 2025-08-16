@@ -1,14 +1,9 @@
 # model/train.py
-# MLX distributed trainer (ring) with loud logging + robust HF streaming:
-# - 429 Too Many Requests → exponential backoff + jitter, then resume
-# - rank-staggered start to spread out Hub load
-# - optional HF token login to increase Hub rate limit
-# - fp16/bf16-safe (attention + CE in fp32), grad accumulation, all-reduce, clip
-# - AUTO-RESUME from latest ckpt if --resume not given
-# - FLUSH-ON-EXIT: save meta/offset (+ autosave ckpt) on Ctrl-C / SIGTERM / exceptions
+# MLX distributed trainer (ring) with loud logging + robust HF streaming
+# + per-rank effective-config dump for debugging.
 
 from __future__ import annotations
-import argparse, pathlib, math, json, time, itertools, socket, os, random, signal
+import argparse, pathlib, math, json, time, itertools, socket, os, random, signal, platform
 from typing import Iterator, Dict, Any
 from collections.abc import Mapping, Sequence
 
@@ -23,6 +18,15 @@ import sentencepiece as spm
 import numpy as np
 import wandb
 
+# versions
+try:
+    import importlib.metadata as md
+    MLX_VERSION = getattr(__import__("mlx"), "__version__", "unknown")
+    MLX_METAL_VERSION = md.version("mlx-metal")
+except Exception:
+    MLX_VERSION = "unknown"
+    MLX_METAL_VERSION = "unknown"
+
 # for catching Hub throttling cleanly
 from huggingface_hub.utils import HfHubHTTPError
 try:
@@ -33,12 +37,15 @@ except Exception:
 from .model import OpenELM, SMLMConfig
 
 # ───────────────────────────────────
+# tiny logger
 def log(rank, *msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [Rank {rank}]", *msg, flush=True)
 
+# ───────────────────────────────────
 def _flatten(tree):
-    if isinstance(tree, mx.array): return [tree]
+    if isinstance(tree, mx.array):
+        return [tree]
     if isinstance(tree, Mapping):
         out = []
         for v in tree.values(): out += _flatten(v)
@@ -55,8 +62,10 @@ def _barrier() -> None:
 def _broadcast_params(params, rank: int) -> None:
     # poor-man's broadcast: zero on non-root, sum-reduce
     for p in tree_map(lambda x: x, params):
-        if not isinstance(p, mx.array): continue
-        if rank != 0: p[...] = 0
+        if not isinstance(p, mx.array):
+            continue
+        if rank != 0:
+            p[...] = 0
         p[...] = mx.distributed.all_sum(p)
 
 def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: str):
@@ -69,22 +78,28 @@ def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
     while True:
         it = iter(ds)
         try:
-            for ex in it: yield ex
+            for ex in it:
+                yield ex
+            # exhausted (rare for streaming) → restart loop
         except HfHubHTTPError as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code == 429:
                 sleep_for = min(backoff, backoff_max) * (1.0 + random.random())
                 log(rank, f"HF 429 Too Many Requests → sleeping {sleep_for:.1f}s then retrying stream …")
-                time.sleep(sleep_for); backoff = min(backoff * 2.0, backoff_max); continue
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2.0, backoff_max)
+                continue
             if code in {500, 502, 503, 504, None}:
                 sleep_for = 5.0 * (1.0 + 0.5 * random.random())
                 log(rank, f"HF transient {code or 'error'} → backoff {sleep_for:.1f}s")
-                time.sleep(sleep_for); continue
+                time.sleep(sleep_for)
+                continue
             raise
         except Exception as e:
             sleep_for = 5.0 * (1.0 + 0.5 * random.random())
             log(rank, f"dataset iterator error: {type(e).__name__}: {e} → retry in {sleep_for:.1f}s")
-            time.sleep(sleep_for); continue
+            time.sleep(sleep_for)
+            continue
 
 def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
     """Packs streaming tokenized examples into fixed windows of length ctx+1."""
@@ -98,14 +113,16 @@ def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) 
                 yield mx.array(chunk).reshape(bs, window)
 
 def cosine_lr(step, *, base, warmup, total, min_lr):
-    if step < warmup: return base * step / max(1, warmup)
+    if step < warmup:
+        return base * step / max(1, warmup)
     t = (step - warmup) / max(1, total - warmup)
     return min_lr + 0.5 * (base - min_lr) * (1 + math.cos(math.pi * t))
 
 def clip_global(tree, max_norm):
     flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
     total = math.sqrt(sum(float((g**2).sum()) for g in flats)) if flats else 0.0
-    if total <= max_norm: return tree
+    if total <= max_norm:
+        return tree
     scale = max_norm / (total + 1e-6)
     return tree_map(lambda x: x * scale if isinstance(x, mx.array) else x, tree)
 
@@ -120,6 +137,60 @@ def get_args():
     p.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
     p.add_argument("--resume")
     return p.parse_args()
+
+# ───────────────────────────────────
+def print_effective_config(
+    rank: int,
+    size: int,
+    cfg: SMLMConfig,
+    *,
+    host: str,
+    default_dtype: str,
+    sp_vocab: int,
+    LOCAL_BS: int,
+    ACCUM_STEPS: int,
+    SHUFFLE_BUF: int,
+):
+    tokens_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
+    info = {
+        "host": host,
+        "rank": rank,
+        "world_size": size,
+        "versions": {"mlx": MLX_VERSION, "mlx-metal": MLX_METAL_VERSION},
+        "device": "gpu" if mx.default_device() == mx.gpu else "cpu",
+        "default_dtype": str(default_dtype),
+        "tokenizer_vocab_size": sp_vocab,
+        "config_vocab_size": cfg.vocab_size,
+        "model": {
+            "num_layers": cfg.num_transformer_layers,
+            "model_dim": cfg.model_dim,
+            "num_heads": cfg.num_heads,
+            "head_dim": cfg.head_dim,
+            "ffn_with_glu": cfg.ffn_with_glu,
+            "use_fast_sdp": getattr(cfg, "use_fast_sdp", True),
+        },
+        "context": {
+            "context_size": cfg.context_size,
+            "rope_max_length": cfg.rope_max_length,
+            "rope_freq_constant": cfg.rope_freq_constant,
+        },
+        "train": {
+            "local_bs": LOCAL_BS,
+            "accum_steps": ACCUM_STEPS,
+            "shuffle_buffer": SHUFFLE_BUF,
+            "max_lr": cfg.max_lr,
+            "min_lr": cfg.min_lr,
+            "warmup_iterations": cfg.warmup_iterations,
+            "weight_decay": cfg.weight_decay,
+            "grad_clip": cfg.grad_clip,
+            "dropout": cfg.dropout,
+        },
+        "derived": {
+            "tokens_per_update": tokens_per_update,
+            "heads_x_dim": cfg.num_heads * cfg.head_dim,
+        },
+    }
+    log(rank, "EFFECTIVE CONFIG →\n" + json.dumps(info, indent=2, sort_keys=True))
 
 # ───────────────────────────────────
 def main():
@@ -154,8 +225,9 @@ def main():
         default_dtype = mx.default_dtype()
     except Exception:
         default_dtype = "n/a"
+
     log(rank, f"device={'gpu' if args.device=='gpu' else 'cpu'} default_dtype={default_dtype}")
-    log(rank, f"use_fast_sdp={cfg.use_fast_sdp}")
+    log(rank, f"use_fast_sdp={getattr(cfg, 'use_fast_sdp', True)}")
 
     # tokenizer + vocab sanity
     log(rank, f"loading tokenizer: {args.tokenizer}")
@@ -174,10 +246,30 @@ def main():
     SHUFFLE_BUF = int(os.getenv("SHUFFLE_BUFFER", 20000))
     BACKOFF_MAX = float(os.getenv("HF_BACKOFF_MAX", "60"))
     STAGGER = float(os.getenv("RANK_STAGGER_SEC", str(rank * 2.0)))  # default: 2s * rank
+
+    # Per-rank config dump (after overrides)
+    print_effective_config(
+        rank, size, cfg,
+        host=platform.node(),
+        default_dtype=default_dtype,
+        sp_vocab=vocab_from_sp,
+        LOCAL_BS=LOCAL_BS,
+        ACCUM_STEPS=ACCUM_STEPS,
+        SHUFFLE_BUF=SHUFFLE_BUF,
+    )
+
+    # quick sanity checks
+    if cfg.model_dim != cfg.num_heads * cfg.head_dim:
+        raise ValueError(f"model_dim ({cfg.model_dim}) != num_heads*head_dim ({cfg.num_heads*cfg.head_dim})")
+    if cfg.context_size > cfg.rope_max_length:
+        log(rank, f"⚠️ context_size ({cfg.context_size}) > rope_max_length ({cfg.rope_max_length}); RoPE may degrade.")
+
     log(rank, f"LOCAL_BS={LOCAL_BS} ACCUM_STEPS={ACCUM_STEPS} SHUFFLE_BUFFER={SHUFFLE_BUF} context={cfg.context_size}")
     log(rank, f"rank-stagger={STAGGER:.1f}s, backoff_max={BACKOFF_MAX:.0f}s")
 
-    if STAGGER > 0: time.sleep(STAGGER)
+    # Give each rank a small stagger to avoid synchronized bursts on the Hub
+    if STAGGER > 0:
+        time.sleep(STAGGER)
 
     # streaming dataset
     download_config = DownloadConfig(max_retries=5)
@@ -196,7 +288,8 @@ def main():
             break
         except Exception as e:
             log(rank, f"load_dataset failed: {e!r}")
-            if attempt == 5: raise
+            if attempt == 5:
+                raise
             time.sleep(5)
 
     ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
@@ -211,17 +304,25 @@ def main():
 
     def find_latest_ckpt(p: pathlib.Path):
         cands = list(p.glob("ckpt_*.safetensors"))
-        if not cands: return None, 0
+        if not cands:
+            return None, 0
         def step_of(fp: pathlib.Path):
-            try: return int(fp.stem.split("_")[-1])
-            except Exception: return 0
+            try:
+                stem = fp.stem
+                # allow ckpt_000010 or ckpt_000010_tag
+                tail = stem.split("_")[-1]
+                return int(tail) if tail.isdigit() else 0
+            except Exception:
+                return 0
         latest = max(cands, key=step_of)
         return latest, step_of(latest)
 
     # offset handling for restarts (data position)
     if offset_file.exists():
-        try: offset = int(offset_file.read_text().strip() or "0")
-        except Exception: offset = 0
+        try:
+            offset = int(offset_file.read_text().strip() or "0")
+        except Exception:
+            offset = 0
     else:
         offset = 0
     log(rank, f"skipping first {offset:,} global tokens (if any)")
@@ -230,9 +331,13 @@ def main():
     rank_offset_tokens = offset // size
     skip_batches = rank_offset_tokens // tokens_per_rank_mb
 
-    # resilient iterator
+    # Wrap the dataset with our resilient iterator to survive 429s
     ds_iter = resilient_dataset_iter(ds, rank, backoff_max=BACKOFF_MAX)
-    train_it = itertools.islice(sample_generator(ds_iter, cfg.context_size, LOCAL_BS), skip_batches, None)
+    train_it = itertools.islice(
+        sample_generator(ds_iter, cfg.context_size, LOCAL_BS),
+        skip_batches,
+        None
+    )
     log(rank, f"packer ready. skip_batches={skip_batches}")
 
     # model + optimizer
@@ -261,6 +366,7 @@ def main():
             except Exception as e:
                 log(rank, f"auto-resume load failed: {e!r}")
 
+    # choose start_step: prefer the weights' step; ignore meta if it's ahead of ckpt
     start_step = int(loaded_ckpt_step)
 
     # broadcast params after any resume
@@ -288,9 +394,9 @@ def main():
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
 
-    # warm-up compile (match real batch length to avoid first-step compile spike)
+    # warm-up compile
     log(rank, "warming up compile for value_and_grad() …")
-    _dummy = mx.array(np.zeros((LOCAL_BS, cfg.context_size + 1), dtype=np.int32))
+    _dummy = mx.array(np.zeros((max(1, 1 if 'LOCAL_BS' not in os.environ else LOCAL_BS), cfg.context_size + 1), dtype=np.int32))
     _ = value_and_grad(model, _dummy); mx.eval(_)
     log(rank, "compile done; starting training loop")
 
@@ -322,8 +428,10 @@ def main():
         signal.signal(signal.SIGINT, _handle)
         signal.signal(signal.SIGTERM, _handle)
 
+    # helper to persist state (ckpt + meta + offset)
     def save_state(step: int, tag: str | None = None):
-        if rank != 0: return
+        if rank != 0:
+            return
         name = f"ckpt_{step:06d}.safetensors" if not tag else f"ckpt_{step:06d}_{tag}.safetensors"
         ckpt_path = out_dir / name
         try:
@@ -331,9 +439,9 @@ def main():
         except Exception as e:
             log(rank, f"checkpoint save failed: {e!r}")
         try:
-            meta_path.write_text(json.dumps({"global_step": int(step)}))
+            (meta_path).write_text(json.dumps({"global_step": int(step)}))
             processed = step * (size * LOCAL_BS * (cfg.context_size + 1))
-            offset_file.write_text(str(processed))
+            (offset_file).write_text(str(processed))
             log(rank, f"💾 saved {ckpt_path.name} | offset={processed:,}")
         except Exception as e:
             log(rank, f"meta/offset save failed: {e!r}")
@@ -357,7 +465,7 @@ def main():
             batch = next(train_it)
             loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
 
-            # detect/skip NaN/Inf
+            # detect/skip NaN loss to keep accumulation clean
             if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
                 if rank == 0:
                     x, y = batch[:, :-1], batch[:, 1:]
@@ -419,6 +527,7 @@ def main():
                     if global_step % 5000 == 0:
                         save_state(global_step, tag=None)
 
+                # stop requested → autosave and exit cleanly
                 if stop_flag["stop"]:
                     save_state(last_completed_step, tag="autosave")
                     break
