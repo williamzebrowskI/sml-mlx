@@ -119,13 +119,15 @@ class FeedForward(nn.Module):
 
 
 class StandardSelfAttention(nn.Module):
-    """Multi-head self-attention with RoPE; numerically safe under fp16/bf16."""
+    """Multi-head self-attention with RoPE; fp32 math for stability.
+       Set cfg.use_fast_sdp=True to try MLX fused attention (may hang on some GPUs)."""
     def __init__(self, cfg: SMLMConfig):
         super().__init__()
         assert cfg.model_dim == cfg.num_heads * cfg.head_dim, "model_dim == num_heads * head_dim"
         self.num_heads = cfg.num_heads
         self.head_dim = cfg.head_dim
         self.scale = 1.0 / math.sqrt(cfg.head_dim)
+        self.use_fast = bool(getattr(cfg, "use_fast_sdp", False))
 
         self.qkv = nn.Linear(cfg.model_dim, 3 * cfg.model_dim, bias=False)
         self.o_proj = nn.Linear(cfg.model_dim, cfg.model_dim, bias=False)
@@ -136,23 +138,41 @@ class StandardSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim).transpose(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, L, D)
 
-        # upcast numerically sensitive parts to fp32
-        base = q.dtype
+        # upcast sensitive parts
+        base = x.dtype
         q = q.astype(mx.float32)
         k = k.astype(mx.float32)
         v = v.astype(mx.float32)
-        if mask.dtype != mx.float32:
-            mask = mask.astype(mx.float32)
 
         # RoPE in fp32
         q = self.rope(q)
         k = self.rope(k)
 
-        # scaled dot-product attention (fp32)
-        attn = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        # Normalize mask shape to (1,1,L,L) and fp32
+        if mask is not None:
+            m = mask
+            if m.dtype != mx.float32:
+                m = m.astype(mx.float32)
+            if m.ndim == 2:        # (L, L)
+                m = m[None, None, ...]
+            elif m.ndim == 3:      # (1, L, L)
+                m = m[:, None, ...]
+        else:
+            m = None
+
+        if self.use_fast:
+            attn = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=m)
+        else:
+            # Scores: (B,H,L,L)
+            scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+            if m is not None:
+                # broadcast additive mask
+                scores = scores + m
+            probs = nn.softmax(scores, axis=-1)
+            attn = probs @ v
+
         out = attn.transpose(0, 2, 1, 3).reshape(B, L, -1).astype(base)
         return self.o_proj(out)
-
 
 class DecoderLayer(nn.Module):
     """Pre-norm block: x + Attn(Norm(x)) ; x + FFN(Norm(x))"""
