@@ -1,5 +1,5 @@
 {
-  "vocab_size": 50096,
+  "vocab_size": 49152,
   "num_transformer_layers": 30,
   "model_dim": 576,
   "num_heads": 9,
@@ -12,13 +12,12 @@
   "ffn_with_glu": true,
 
   "rope_freq_constant": 10000,
-  "rope_max_length": 4096,
+  "rope_max_length": 2048,
   "normalization_layer_name": "rmsnorm",
   "activation_fn_name": "silu",
 
   "context_size": 512,
   "dropout": 0.0,
-  "use_fast_sdp": false,
 
   "max_iterations": 1000000,
   "warmup_iterations": 20000,
@@ -31,6 +30,6 @@
   "tokenizer_path": "tokenizer/fineweb_spm/spm.model",
   "checkpoint_dir": "runs/sml-lm",
 
-  "local_bs": 1,
-  "accum_steps": 16
+  "local_bs": 2,
+  "accum_steps": 8
 }
