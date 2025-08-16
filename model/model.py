@@ -3,6 +3,7 @@
 # - Attention softmax runs in fp32 (Q/K/V + mask upcast), then cast back.
 # - Cross-entropy computed in fp32.
 # - Pre-norm Transformer blocks, RoPE positional encoding, tied embeddings.
+# - Config flag `use_fast_sdp` lets you disable fused SDPA kernels on Metal.
 
 import math, json, pathlib, dataclasses
 from typing import List
@@ -25,12 +26,12 @@ class SMLMConfig:
     ffn_dim_divisor: int = 256
     ffn_with_glu: bool = True
     rope_freq_constant: int = 10000
-    rope_max_length: int = 512
+    rope_max_length: int = 2048
     normalization_layer_name: str = "rmsnorm"
     activation_fn_name: str = "silu"
-    context_size: int = 512
+    context_size: int = 2048
     share_input_output_layers: bool = True
-    use_fast_sdp: bool = True      # NEW: fused SDPA toggle
+    use_fast_sdp: bool = True
     dropout: float = 0.0
 
     # training knobs (used by train.py too)
@@ -40,9 +41,9 @@ class SMLMConfig:
     min_lr: float = 1e-6
     weight_decay: float = 0.1
     grad_clip: float = 1.0
-    torch_dtype: str = "bfloat16"  # or "bfloat16"
-    local_bs: int = 2
-    accum_steps: int = 8
+    torch_dtype: str = "float16"  # or "bfloat16"
+    local_bs: int = 4
+    accum_steps: int = 16
 
     # optional metadata
     tokenizer_path: str = ""
@@ -57,19 +58,15 @@ class SMLMConfig:
             num_transformer_layers=raw["num_transformer_layers"],
             num_heads=raw["num_heads"],
             head_dim=raw["head_dim"],
-            ffn_multipliers=raw.get(
-                "ffn_multipliers",
-                [4.0] * int(raw["num_transformer_layers"])
-            ),
+            ffn_multipliers=raw.get("ffn_multipliers", [4.0] * int(raw["num_transformer_layers"])),
             ffn_dim_divisor=int(raw.get("ffn_dim_divisor", 256)),
             ffn_with_glu=bool(raw.get("ffn_with_glu", True)),
             rope_freq_constant=int(raw.get("rope_freq_constant", 10000)),
-            rope_max_length=int(raw.get("rope_max_length", raw.get("context_size", 512))),
-            normalization_layer_name=str(raw.get("normalization_layer_name", "rmsnorm")).replace("rms_norm", "rmsnorm"),
-            activation_fn_name=str(raw.get("activation_fn_name", "silu")).replace("swish", "silu"),
-            context_size=int(raw.get("context_size", 512)),
+            rope_max_length=int(raw.get("rope_max_length", raw.get("context_size", 2048))),
+            normalization_layer_name=str(raw.get("normalization_layer_name", "rmsnorm")).replace("rms_norm","rmsnorm"),
+            activation_fn_name=str(raw.get("activation_fn_name", "silu")).replace("swish","silu"),
+            context_size=int(raw.get("context_size", 2048)),
             share_input_output_layers=bool(raw.get("share_input_output_layers", True)),
-            use_fast_sdp=bool(raw.get("use_fast_sdp", True)),  # NEW
             dropout=float(raw.get("dropout", 0.0)),
             max_iterations=int(raw.get("max_iterations", 1_000_000)),
             warmup_iterations=int(raw.get("warmup_iterations", 20_000)),
@@ -82,6 +79,7 @@ class SMLMConfig:
             accum_steps=int(raw.get("accum_steps", 16)),
             tokenizer_path=str(raw.get("tokenizer_path", "")),
             checkpoint_dir=str(raw.get("checkpoint_dir", "runs/sml-lm")),
+            use_fast_sdp=bool(raw.get("use_fast_sdp", True)),
         )
         return cfg
 
@@ -101,11 +99,7 @@ class FeedForward(nn.Module):
         self.proj_in = nn.Linear(cfg.model_dim, out_feats, bias=False)
         self.proj_out = nn.Linear(inter, cfg.model_dim, bias=False)
 
-        acts = {
-            "relu": nn.ReLU(),
-            "silu": nn.SiLU(),
-            "gelu": nn.GELU(),
-        }
+        acts = {"relu": nn.ReLU(), "silu": nn.SiLU(), "gelu": nn.GELU()}
         self.act = acts[cfg.activation_fn_name]
         self.dropout = nn.Dropout(cfg.dropout)
 
@@ -121,7 +115,7 @@ class FeedForward(nn.Module):
 
 
 class StandardSelfAttention(nn.Module):
-    """Multi-head self-attention with RoPE; toggle fused vs. manual SDPA."""
+    """Multi-head self-attention with RoPE; numerically safe under fp16/bf16."""
     def __init__(self, cfg: SMLMConfig):
         super().__init__()
         assert cfg.model_dim == cfg.num_heads * cfg.head_dim, "model_dim == num_heads * head_dim"
@@ -140,24 +134,19 @@ class StandardSelfAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, L, D)
 
         # upcast numerically sensitive parts to fp32
-        base = x.dtype
-        q = q.astype(mx.float32)
-        k = k.astype(mx.float32)
-        v = v.astype(mx.float32)
-        if mask.dtype != mx.float32:
-            mask = mask.astype(mx.float32)
+        base = q.dtype
+        q = q.astype(mx.float32); k = k.astype(mx.float32); v = v.astype(mx.float32)
+        if mask.dtype != mx.float32: mask = mask.astype(mx.float32)
 
         # RoPE in fp32
-        q = self.rope(q)
-        k = self.rope(k)
+        q = self.rope(q); k = self.rope(k)
 
         if self.use_fast_sdp:
             attn = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         else:
-            # Manual SDPA: usually dispatches more, smaller kernels (avoids Metal watchdog)
-            # q,k,v: (B,H,L,D) → scores: (B,H,L,L)
+            # Manual SDPA in fp32 (split into smaller kernels; more forgiving on Metal)
             scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-            scores = scores + mask  # additive causal mask (0 or -inf)
+            scores = scores + mask  # additive causal (-inf on masked)
             weights = nn.softmax(scores, axis=-1)
             attn = weights @ v
 

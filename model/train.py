@@ -33,15 +33,12 @@ except Exception:
 from .model import OpenELM, SMLMConfig
 
 # ───────────────────────────────────
-# tiny logger
 def log(rank, *msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [Rank {rank}]", *msg, flush=True)
 
-# ───────────────────────────────────
 def _flatten(tree):
-    if isinstance(tree, mx.array):
-        return [tree]
+    if isinstance(tree, mx.array): return [tree]
     if isinstance(tree, Mapping):
         out = []
         for v in tree.values(): out += _flatten(v)
@@ -58,10 +55,8 @@ def _barrier() -> None:
 def _broadcast_params(params, rank: int) -> None:
     # poor-man's broadcast: zero on non-root, sum-reduce
     for p in tree_map(lambda x: x, params):
-        if not isinstance(p, mx.array):
-            continue
-        if rank != 0:
-            p[...] = 0
+        if not isinstance(p, mx.array): continue
+        if rank != 0: p[...] = 0
         p[...] = mx.distributed.all_sum(p)
 
 def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: str):
@@ -74,28 +69,22 @@ def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
     while True:
         it = iter(ds)
         try:
-            for ex in it:
-                yield ex
-            # exhausted (rare for streaming) → restart loop
+            for ex in it: yield ex
         except HfHubHTTPError as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code == 429:
                 sleep_for = min(backoff, backoff_max) * (1.0 + random.random())
                 log(rank, f"HF 429 Too Many Requests → sleeping {sleep_for:.1f}s then retrying stream …")
-                time.sleep(sleep_for)
-                backoff = min(backoff * 2.0, backoff_max)
-                continue
+                time.sleep(sleep_for); backoff = min(backoff * 2.0, backoff_max); continue
             if code in {500, 502, 503, 504, None}:
                 sleep_for = 5.0 * (1.0 + 0.5 * random.random())
                 log(rank, f"HF transient {code or 'error'} → backoff {sleep_for:.1f}s")
-                time.sleep(sleep_for)
-                continue
+                time.sleep(sleep_for); continue
             raise
         except Exception as e:
             sleep_for = 5.0 * (1.0 + 0.5 * random.random())
             log(rank, f"dataset iterator error: {type(e).__name__}: {e} → retry in {sleep_for:.1f}s")
-            time.sleep(sleep_for)
-            continue
+            time.sleep(sleep_for); continue
 
 def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
     """Packs streaming tokenized examples into fixed windows of length ctx+1."""
@@ -109,16 +98,14 @@ def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) 
                 yield mx.array(chunk).reshape(bs, window)
 
 def cosine_lr(step, *, base, warmup, total, min_lr):
-    if step < warmup:
-        return base * step / max(1, warmup)
+    if step < warmup: return base * step / max(1, warmup)
     t = (step - warmup) / max(1, total - warmup)
     return min_lr + 0.5 * (base - min_lr) * (1 + math.cos(math.pi * t))
 
 def clip_global(tree, max_norm):
     flats = [l for l in tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
     total = math.sqrt(sum(float((g**2).sum()) for g in flats)) if flats else 0.0
-    if total <= max_norm:
-        return tree
+    if total <= max_norm: return tree
     scale = max_norm / (total + 1e-6)
     return tree_map(lambda x: x * scale if isinstance(x, mx.array) else x, tree)
 
@@ -168,6 +155,7 @@ def main():
     except Exception:
         default_dtype = "n/a"
     log(rank, f"device={'gpu' if args.device=='gpu' else 'cpu'} default_dtype={default_dtype}")
+    log(rank, f"use_fast_sdp={cfg.use_fast_sdp}")
 
     # tokenizer + vocab sanity
     log(rank, f"loading tokenizer: {args.tokenizer}")
@@ -189,9 +177,7 @@ def main():
     log(rank, f"LOCAL_BS={LOCAL_BS} ACCUM_STEPS={ACCUM_STEPS} SHUFFLE_BUFFER={SHUFFLE_BUF} context={cfg.context_size}")
     log(rank, f"rank-stagger={STAGGER:.1f}s, backoff_max={BACKOFF_MAX:.0f}s")
 
-    # Give each rank a small stagger to avoid synchronized bursts on the Hub
-    if STAGGER > 0:
-        time.sleep(STAGGER)
+    if STAGGER > 0: time.sleep(STAGGER)
 
     # streaming dataset
     download_config = DownloadConfig(max_retries=5)
@@ -210,8 +196,7 @@ def main():
             break
         except Exception as e:
             log(rank, f"load_dataset failed: {e!r}")
-            if attempt == 5:
-                raise
+            if attempt == 5: raise
             time.sleep(5)
 
     ds = ds.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
@@ -226,38 +211,28 @@ def main():
 
     def find_latest_ckpt(p: pathlib.Path):
         cands = list(p.glob("ckpt_*.safetensors"))
-        if not cands:
-            return None, 0
+        if not cands: return None, 0
         def step_of(fp: pathlib.Path):
-            try:
-                return int(fp.stem.split("_")[-1])
-            except Exception:
-                return 0
+            try: return int(fp.stem.split("_")[-1])
+            except Exception: return 0
         latest = max(cands, key=step_of)
         return latest, step_of(latest)
 
     # offset handling for restarts (data position)
     if offset_file.exists():
-        try:
-            offset = int(offset_file.read_text().strip() or "0")
-        except Exception:
-            offset = 0
+        try: offset = int(offset_file.read_text().strip() or "0")
+        except Exception: offset = 0
     else:
         offset = 0
     log(rank, f"skipping first {offset:,} global tokens (if any)")
 
     tokens_per_rank_mb = LOCAL_BS * (cfg.context_size + 1)
-    rank, size = rank, size
     rank_offset_tokens = offset // size
     skip_batches = rank_offset_tokens // tokens_per_rank_mb
 
-    # Wrap the dataset with our resilient iterator to survive 429s
+    # resilient iterator
     ds_iter = resilient_dataset_iter(ds, rank, backoff_max=BACKOFF_MAX)
-    train_it = itertools.islice(
-        sample_generator(ds_iter, cfg.context_size, LOCAL_BS),
-        skip_batches,
-        None
-    )
+    train_it = itertools.islice(sample_generator(ds_iter, cfg.context_size, LOCAL_BS), skip_batches, None)
     log(rank, f"packer ready. skip_batches={skip_batches}")
 
     # model + optimizer
@@ -286,7 +261,6 @@ def main():
             except Exception as e:
                 log(rank, f"auto-resume load failed: {e!r}")
 
-    # choose start_step: prefer the weights' step; ignore meta if it's ahead of ckpt
     start_step = int(loaded_ckpt_step)
 
     # broadcast params after any resume
@@ -314,7 +288,7 @@ def main():
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
 
-    # warm-up compile
+    # warm-up compile (match real batch length to avoid first-step compile spike)
     log(rank, "warming up compile for value_and_grad() …")
     _dummy = mx.array(np.zeros((LOCAL_BS, cfg.context_size + 1), dtype=np.int32))
     _ = value_and_grad(model, _dummy); mx.eval(_)
@@ -348,10 +322,8 @@ def main():
         signal.signal(signal.SIGINT, _handle)
         signal.signal(signal.SIGTERM, _handle)
 
-    # helper to persist state (ckpt + meta + offset)
     def save_state(step: int, tag: str | None = None):
-        if rank != 0:
-            return
+        if rank != 0: return
         name = f"ckpt_{step:06d}.safetensors" if not tag else f"ckpt_{step:06d}_{tag}.safetensors"
         ckpt_path = out_dir / name
         try:
@@ -359,9 +331,9 @@ def main():
         except Exception as e:
             log(rank, f"checkpoint save failed: {e!r}")
         try:
-            (meta_path).write_text(json.dumps({"global_step": int(step)}))
+            meta_path.write_text(json.dumps({"global_step": int(step)}))
             processed = step * (size * LOCAL_BS * (cfg.context_size + 1))
-            (offset_file).write_text(str(processed))
+            offset_file.write_text(str(processed))
             log(rank, f"💾 saved {ckpt_path.name} | offset={processed:,}")
         except Exception as e:
             log(rank, f"meta/offset save failed: {e!r}")
@@ -385,7 +357,7 @@ def main():
             batch = next(train_it)
             loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
 
-            # detect/skip NaN loss to keep accumulation clean
+            # detect/skip NaN/Inf
             if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
                 if rank == 0:
                     x, y = batch[:, :-1], batch[:, 1:]
@@ -447,7 +419,6 @@ def main():
                     if global_step % 5000 == 0:
                         save_state(global_step, tag=None)
 
-                # stop requested → autosave and exit cleanly
                 if stop_flag["stop"]:
                     save_state(last_completed_step, tag="autosave")
                     break
