@@ -30,6 +30,6 @@
   "tokenizer_path": "tokenizer/fineweb_spm/spm.model",
   "checkpoint_dir": "runs/sml-lm",
   "use_fast_sdp": false,
-  "local_bs": 1,
-  "accum_steps": 16
+  "local_bs": 2,
+  "accum_steps": 8
 }
