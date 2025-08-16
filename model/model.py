@@ -30,6 +30,7 @@ class SMLMConfig:
     activation_fn_name: str = "silu"
     context_size: int = 2048
     share_input_output_layers: bool = True
+    use_fast_sdp: bool = True      # NEW: fused SDPA toggle
     dropout: float = 0.0
 
     # training knobs (used by train.py too)
@@ -64,10 +65,11 @@ class SMLMConfig:
             ffn_with_glu=bool(raw.get("ffn_with_glu", True)),
             rope_freq_constant=int(raw.get("rope_freq_constant", 10000)),
             rope_max_length=int(raw.get("rope_max_length", raw.get("context_size", 2048))),
-            normalization_layer_name=str(raw.get("normalization_layer_name", "rmsnorm")).replace("rms_norm","rmsnorm"),
-            activation_fn_name=str(raw.get("activation_fn_name", "silu")).replace("swish","silu"),
+            normalization_layer_name=str(raw.get("normalization_layer_name", "rmsnorm")).replace("rms_norm", "rmsnorm"),
+            activation_fn_name=str(raw.get("activation_fn_name", "silu")).replace("swish", "silu"),
             context_size=int(raw.get("context_size", 2048)),
             share_input_output_layers=bool(raw.get("share_input_output_layers", True)),
+            use_fast_sdp=bool(raw.get("use_fast_sdp", True)),  # NEW
             dropout=float(raw.get("dropout", 0.0)),
             max_iterations=int(raw.get("max_iterations", 1_000_000)),
             warmup_iterations=int(raw.get("warmup_iterations", 20_000)),
@@ -119,15 +121,14 @@ class FeedForward(nn.Module):
 
 
 class StandardSelfAttention(nn.Module):
-    """Multi-head self-attention with RoPE; fp32 math for stability.
-       Set cfg.use_fast_sdp=True to try MLX fused attention (may hang on some GPUs)."""
+    """Multi-head self-attention with RoPE; toggle fused vs. manual SDPA."""
     def __init__(self, cfg: SMLMConfig):
         super().__init__()
         assert cfg.model_dim == cfg.num_heads * cfg.head_dim, "model_dim == num_heads * head_dim"
         self.num_heads = cfg.num_heads
         self.head_dim = cfg.head_dim
         self.scale = 1.0 / math.sqrt(cfg.head_dim)
-        self.use_fast = bool(getattr(cfg, "use_fast_sdp", False))
+        self.use_fast_sdp = cfg.use_fast_sdp
 
         self.qkv = nn.Linear(cfg.model_dim, 3 * cfg.model_dim, bias=False)
         self.o_proj = nn.Linear(cfg.model_dim, cfg.model_dim, bias=False)
@@ -138,41 +139,31 @@ class StandardSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim).transpose(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, L, D)
 
-        # upcast sensitive parts
+        # upcast numerically sensitive parts to fp32
         base = x.dtype
         q = q.astype(mx.float32)
         k = k.astype(mx.float32)
         v = v.astype(mx.float32)
+        if mask.dtype != mx.float32:
+            mask = mask.astype(mx.float32)
 
         # RoPE in fp32
         q = self.rope(q)
         k = self.rope(k)
 
-        # Normalize mask shape to (1,1,L,L) and fp32
-        if mask is not None:
-            m = mask
-            if m.dtype != mx.float32:
-                m = m.astype(mx.float32)
-            if m.ndim == 2:        # (L, L)
-                m = m[None, None, ...]
-            elif m.ndim == 3:      # (1, L, L)
-                m = m[:, None, ...]
+        if self.use_fast_sdp:
+            attn = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         else:
-            m = None
-
-        if self.use_fast:
-            attn = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=m)
-        else:
-            # Scores: (B,H,L,L)
+            # Manual SDPA: usually dispatches more, smaller kernels (avoids Metal watchdog)
+            # q,k,v: (B,H,L,D) → scores: (B,H,L,L)
             scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-            if m is not None:
-                # broadcast additive mask
-                scores = scores + m
-            probs = nn.softmax(scores, axis=-1)
-            attn = probs @ v
+            scores = scores + mask  # additive causal mask (0 or -inf)
+            weights = nn.softmax(scores, axis=-1)
+            attn = weights @ v
 
         out = attn.transpose(0, 2, 1, 3).reshape(B, L, -1).astype(base)
         return self.o_proj(out)
+
 
 class DecoderLayer(nn.Module):
     """Pre-norm block: x + Attn(Norm(x)) ; x + FFN(Norm(x))"""
