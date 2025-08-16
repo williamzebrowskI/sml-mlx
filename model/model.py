@@ -40,7 +40,7 @@ class SMLMConfig:
     min_lr: float = 1e-6
     weight_decay: float = 0.1
     grad_clip: float = 1.0
-    torch_dtype: str = "float16"  # or "bfloat16"
+    torch_dtype: str = "bfloat16"  # or "bfloat16"
     local_bs: int = 2
     accum_steps: int = 8
 
