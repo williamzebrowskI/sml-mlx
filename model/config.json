@@ -31,5 +31,5 @@
   "checkpoint_dir": "runs/sml-lm",
   "use_fast_sdp": false,
   "local_bs": 1,
-  "accum_steps": 64
+  "accum_steps": 16
 }
