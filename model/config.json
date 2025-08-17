@@ -4,7 +4,7 @@
 
   "bos_token_id": 1,
   "eos_token_id": 2,
-  "vocab_size": 28000,
+  "vocab_size": 50096,
 
   "num_transformer_layers": 6,
   "model_dim": 512,
