@@ -1,36 +1,43 @@
 {
-  "vocab_size": 49152,
-  "num_transformer_layers": 30,
-  "model_dim": 576,
-  "num_heads": 9,
+  "model_type": "OpenSML",
+  "architectures": ["OpenSMLCasual"],
+
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "vocab_size": 28000,
+
+  "num_transformer_layers": 6,
+  "model_dim": 512,
+  "num_heads": 8,
   "head_dim": 64,
 
-  "ffn_multipliers": [2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,
-                      2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,
-                      2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667,2.6666667],
+  "normalize_qk_projections": false,
+
+  "ffn_multipliers": [3,3,3,3,3,3],
   "ffn_dim_divisor": 256,
   "ffn_with_glu": true,
 
   "rope_freq_constant": 10000,
-  "rope_max_length": 512,
-  "normalization_layer_name": "rmsnorm",
-  "activation_fn_name": "silu",
+  "rope_max_length": 4096,
+  "normalization_layer_name": "rms_norm",
+  "activation_fn_name": "swish",
+  "initializer_range": 0.02,
+  "share_input_output_layers": true,
 
   "context_size": 512,
-  "dropout": 0.0,
-
+  "train_batch_size": 16,
   "max_iterations": 1000000,
   "warmup_iterations": 20000,
+
   "max_lr": 0.0001,
   "min_lr": 0.000001,
+  "dropout": 0.1,
   "weight_decay": 0.01,
-  "grad_clip": 1.0,
+  "grad_clip": 0.5,
 
+  "use_cache": true,
   "mlx_dtype": "bfloat16",
-  "tokenizer_path": "tokenizer/fineweb_spm/spm.model",
-  "checkpoint_dir": "runs/sml-lm",
-  "use_fast_sdp": false,
-
-  "local_bs": 2,
-  "accum_steps": 8
+  "transformers_version": "4.39.3",
+  "tokenizer_path": "tokenizer/spm.model",
+  "checkpoint_dir": "runs/sml-lm"
 }
