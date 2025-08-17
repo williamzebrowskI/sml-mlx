@@ -396,7 +396,7 @@ def main():
 
     # warm-up compile
     log(rank, "warming up compile for value_and_grad() …")
-    _dummy = mx.array(np.zeros((max(1, 1 if 'LOCAL_BS' not in os.environ else LOCAL_BS), cfg.context_size + 1), dtype=np.int32))
+    _dummy = mx.array(np.zeros((LOCAL_BS, cfg.context_size + 1), dtype=np.int32))
     _ = value_and_grad(model, _dummy); mx.eval(_)
     log(rank, "compile done; starting training loop")
 
