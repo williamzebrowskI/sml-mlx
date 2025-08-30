@@ -1,11 +1,11 @@
 {
   "vocab_size": 28000,
-  "num_transformer_layers": 6,
-  "model_dim": 512,
-  "num_heads": 8,
+  "num_transformer_layers": 10,
+  "model_dim": 768,
+  "num_heads": 12,
   "head_dim": 64,
 
-  "ffn_multipliers": [3, 3, 3, 3, 3, 3],
+  "ffn_multipliers": [3,3,3,3,3,3,3,3,3,3],
   "ffn_dim_divisor": 256,
   "ffn_with_glu": true,
 
@@ -27,7 +27,7 @@
   "mlx_dtype": "bfloat16",
   "tokenizer_path": "tokenizer/fineweb_28k.model",
   "checkpoint_dir": "runs/sml-lm",
-  "use_fast_sdp": false,
+  "use_fast_sdp": true,
 
   "local_bs": 2,
   "accum_steps": 8
