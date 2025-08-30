@@ -25,7 +25,7 @@
   "grad_clip": 0.5,
 
   "mlx_dtype": "bfloat16",
-  "tokenizer_path": "tokenizer/fineweb_28k.model",
+  "tokenizer_path": "tokenizer/spm.model",
   "checkpoint_dir": "runs/sml-lm",
   "use_fast_sdp": true,
 
