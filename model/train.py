@@ -560,7 +560,7 @@ from mlx.utils import tree_map
 from datasets import load_dataset, DownloadConfig
 import sentencepiece as spm
 import numpy as np
-import wandb
+# import wandb
 
 # optional 50/50 mixer (you said it's already imported in your project)
 from .data_mixer import build_50_50_stream
@@ -1003,12 +1003,12 @@ def main():
     _ = value_and_grad(model, _dummy); mx.eval(_)
     log(rank, "compile done; starting training loop")
 
-    if rank == 0:
-        wandb.init(
-            project="fineweb-pretrain",
-            config={**cfg.__dict__, "LOCAL_BS": LOCAL_BS, "ACCUM_STEPS": ACCUM_STEPS, "world_size": size},
-            name=f"pretrain-{start_step:06d}",
-        )
+    # if rank == 0:
+    #     wandb.init(
+    #         project="fineweb-pretrain",
+    #         config={**cfg.__dict__, "LOCAL_BS": LOCAL_BS, "ACCUM_STEPS": ACCUM_STEPS, "world_size": size},
+    #         name=f"pretrain-{start_step:06d}",
+    #     )
 
     def compute_grad_norm(tree) -> float:
         flats = [g for g in _flatten(tree) if isinstance(g, mx.array)]
@@ -1117,14 +1117,14 @@ def main():
                             f"updates/s={updates_per_sec:.2f} tokens/s≈{tokens_per_sec:,.0f}",
                             flush=True
                         )
-                        wandb.log({
-                            "train/loss": float(avg_loss),
-                            "train/perplexity": float(ppl),
-                            "train/lr": float(opt.learning_rate),
-                            "train/grad_norm": float(grad_norm),
-                            "train/updates_per_sec": float(updates_per_sec),
-                            "train/tokens_per_sec": float(tokens_per_sec),
-                        }, step=int(global_step))
+                        # wandb.log({
+                        #     "train/loss": float(avg_loss),
+                        #     "train/perplexity": float(ppl),
+                        #     "train/lr": float(opt.learning_rate),
+                        #     "train/grad_norm": float(grad_norm),
+                        #     "train/updates_per_sec": float(updates_per_sec),
+                        #     "train/tokens_per_sec": float(tokens_per_sec),
+                        # }, step=int(global_step))
                         acc_l = acc_s = 0
 
                     if global_step % 5000 == 0:

@@ -4,9 +4,10 @@
 # - Cross-entropy computed in fp32.
 # - Pre-norm Transformer blocks, RoPE positional encoding, tied embeddings.
 # - Config flag `use_fast_sdp` lets you disable fused SDPA kernels on Metal.
+# - NEW: Chunked logits projection via `logits_chunk` to avoid GPU watchdog timeouts.
 
 import math, json, pathlib, dataclasses
-from typing import List
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -42,12 +43,15 @@ class SMLMConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     torch_dtype: str = "float16"  # or "bfloat16"
-    local_bs: int = 4
+    local_bs: int = 1
     accum_steps: int = 16
 
     # optional metadata
     tokenizer_path: str = ""
     checkpoint_dir: str = "runs/sml-lm"
+
+    # NEW: chunk size for final logits projection (0 disables; 1024 is a safe default)
+    logits_chunk: int = 1024
 
     @classmethod
     def from_json(cls, path: str) -> "SMLMConfig":
@@ -80,6 +84,7 @@ class SMLMConfig:
             tokenizer_path=str(raw.get("tokenizer_path", "")),
             checkpoint_dir=str(raw.get("checkpoint_dir", "runs/sml-lm")),
             use_fast_sdp=bool(raw.get("use_fast_sdp", True)),
+            logits_chunk=int(raw.get("logits_chunk", 1024)),
         )
         return cfg
 
@@ -189,4 +194,16 @@ class OpenELM(nn.Module):
         for layer in self.layers:
             h = layer(h, mask=mask)
         h = self.final_norm(h)
-        return self.lm_head(h)
+
+        # --- Chunked logits to avoid long-running single GEMM on Metal ---
+        # If cfg.logits_chunk <= 0, fall back to a single matmul.
+        chunk = int(self.cfg.logits_chunk) if getattr(self.cfg, "logits_chunk", 0) else 0
+        if chunk and chunk > 0:
+            flat = h.reshape(B * L, self.cfg.model_dim)
+            outs = []
+            for i in range(0, flat.shape[0], chunk):
+                outs.append(self.lm_head(flat[i:i + chunk]))
+            logits = mx.concatenate(outs, axis=0).reshape(B, L, self.cfg.vocab_size)
+            return logits
+        else:
+            return self.lm_head(h)
