@@ -4,10 +4,10 @@
 # - Cross-entropy computed in fp32.
 # - Pre-norm Transformer blocks, RoPE positional encoding, tied embeddings.
 # - Config flag `use_fast_sdp` lets you disable fused SDPA kernels on Metal.
-# - NEW: Chunked logits projection via `logits_chunk` to avoid GPU watchdog timeouts.
+# - NEW: chunked logits via `logits_chunk_tokens` to avoid long Metal kernels.
 
 import math, json, pathlib, dataclasses
-from typing import List, Optional
+from typing import List
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -43,15 +43,15 @@ class SMLMConfig:
     weight_decay: float = 0.1
     grad_clip: float = 1.0
     torch_dtype: str = "float16"  # or "bfloat16"
-    local_bs: int = 1
+    local_bs: int = 4
     accum_steps: int = 16
+
+    # runtime stability knobs
+    logits_chunk_tokens: int = 128  # ← NEW: chunk size along sequence for lm_head
 
     # optional metadata
     tokenizer_path: str = ""
     checkpoint_dir: str = "runs/sml-lm"
-
-    # NEW: chunk size for final logits projection (0 disables; 1024 is a safe default)
-    logits_chunk: int = 1024
 
     @classmethod
     def from_json(cls, path: str) -> "SMLMConfig":
@@ -84,7 +84,7 @@ class SMLMConfig:
             tokenizer_path=str(raw.get("tokenizer_path", "")),
             checkpoint_dir=str(raw.get("checkpoint_dir", "runs/sml-lm")),
             use_fast_sdp=bool(raw.get("use_fast_sdp", True)),
-            logits_chunk=int(raw.get("logits_chunk", 1024)),
+            logits_chunk_tokens=int(raw.get("logits_chunk_tokens", 128)),
         )
         return cfg
 
@@ -175,7 +175,7 @@ class DecoderLayer(nn.Module):
 
 
 class OpenELM(nn.Module):
-    """Full decoder-only LM with tied embeddings."""
+    """Full decoder-only LM with tied embeddings + chunked logits."""
     def __init__(self, cfg: SMLMConfig):
         super().__init__()
         self.cfg = cfg
@@ -195,15 +195,12 @@ class OpenELM(nn.Module):
             h = layer(h, mask=mask)
         h = self.final_norm(h)
 
-        # --- Chunked logits to avoid long-running single GEMM on Metal ---
-        # If cfg.logits_chunk <= 0, fall back to a single matmul.
-        chunk = int(self.cfg.logits_chunk) if getattr(self.cfg, "logits_chunk", 0) else 0
-        if chunk and chunk > 0:
-            flat = h.reshape(B * L, self.cfg.model_dim)
+        # Chunk the large (B, L, D) @ (D, V) → (B, L, V) projection along L
+        chunk = int(getattr(self.cfg, "logits_chunk_tokens", 0) or 0)
+        if chunk > 0 and L > chunk:
             outs = []
-            for i in range(0, flat.shape[0], chunk):
-                outs.append(self.lm_head(flat[i:i + chunk]))
-            logits = mx.concatenate(outs, axis=0).reshape(B, L, self.cfg.vocab_size)
-            return logits
+            for i in range(0, L, chunk):
+                outs.append(self.lm_head(h[:, i:i+chunk, :]))
+            return mx.concatenate(outs, axis=1)
         else:
             return self.lm_head(h)

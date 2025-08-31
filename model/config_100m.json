@@ -30,5 +30,6 @@
   "use_fast_sdp": false,
 
   "local_bs": 1,
-  "accum_steps": 16
+  "accum_steps": 16,
+  "logits_chunk_tokens": 128
 }
