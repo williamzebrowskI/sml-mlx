@@ -1,31 +1,39 @@
 #!/usr/bin/env python3
 """
-MLX inference for your OpenELM checkpoints, iterating a fixed RUNS list.
+MLX inference for OpenELM checkpoints.
 
 - Auto-picks latest ckpt in --ckpt-dir (or use --checkpoint)
 - Aligns vocab_size to tokenizer size (avoids emb/lm_head shape errors)
-- Softmax in fp32; sliding window uses cfg.context_size (e.g., 512)
-- Per-run sampling settings from RUNS (prompt, temp, top_k, top_p)
+- Dropout disabled via model.eval()
+- Adds BOS to prompt to match training (add_bos=True)
+- Softmax in fp32; sliding window uses cfg.context_size
 """
 
 from __future__ import annotations
-import argparse, pathlib, sys, time, random
+import argparse, pathlib, sys, time, random, os
 from typing import List, Tuple, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import sentencepiece as spm
 
-from model.model import OpenELM, SMLMConfig
+# import model + config
+try:
+    from model.model import OpenELM, SMLMConfig          # run as: python -m model.inference
+except Exception:
+    # fallback if someone runs this file directly
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    import model as model_mod
+    OpenELM, SMLMConfig = model_mod.OpenELM, model_mod.SMLMConfig
 
 # ────────────────────────────── RUNS ────────────────────────────────
 # (prompt, temperature, top_k, top_p)
 RUNS: List[Tuple[str, float, int, float]] = [
     ("Once upon a time in a faraway land, there lived a young princess who…", 0.1, 50, 0.7),
-    ("The capital of France is ",                                            0.1, 20, 0.5),
-    ("Explain quantum computing to me: ",                                    0.2, 50, 0.7),
-    ("A recipe for blueberry muffins: ",                                     0.1, 30, 0.6),
-    ("In the future, humans will ",                                          0.2, 50, 0.7),
+    ("The capital of France is ",                                            0.0, 0, 1.0),
+    ("Explain quantum computing to me: ",                                    0.2, 50, 0.9),
+    ("A recipe for blueberry muffins: ",                                     0.1, 30, 0.8),
+    ("# file: merge.py\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted lists.\"\"\"\n", 0.0, 0, 1.0),
 ]
 
 # ─────────────────────────── small utils ────────────────────────────
@@ -67,9 +75,7 @@ def apply_repetition_penalty(logits: mx.array, generated: List[int], penalty: fl
 def filter_top_k(logits: mx.array, k: int) -> mx.array:
     if k is None or k <= 0 or k >= int(logits.size):
         return logits
-    # MLX returns just the top-k values (sorted descending).
-    # The last value in that list is the threshold.
-    topk_vals = mx.topk(logits, k=k)   # 1-D array of k values
+    topk_vals = mx.topk(logits, k=k)   # sorted descending
     kth = topk_vals[-1]
     return mx.where(logits < kth, -mx.inf, logits)
 
@@ -106,7 +112,7 @@ def load_model_and_tok(cfg_path: str, spm_path: str, ckpt_path: Optional[str], c
     mx.set_default_device(mx.gpu if device == "gpu" else mx.cpu)
     cfg = SMLMConfig.from_json(cfg_path)
 
-    # Load tokenizer FIRST and align vocab_size to it (avoids shape mismatches)
+    # Load tokenizer FIRST and align vocab_size to it
     tok = spm.SentencePieceProcessor(model_file=spm_path)
     sp_vocab = int(tok.get_piece_size())
     if cfg.vocab_size != sp_vocab:
@@ -120,8 +126,10 @@ def load_model_and_tok(cfg_path: str, spm_path: str, ckpt_path: Optional[str], c
             mx.set_default_dtype(mx.bfloat16)
 
     model = OpenELM(cfg)
+    # Disable dropout etc. during generation
+    if hasattr(model, "eval"):
+        model.eval()
 
-    # Choose checkpoint
     ckpt = pathlib.Path(ckpt_path) if ckpt_path else pick_latest_ckpt(pathlib.Path(ckpt_dir))
     if ckpt is None or not ckpt.exists():
         sys.exit(f"❌ No valid checkpoint found (looked in {ckpt_dir})")
@@ -139,13 +147,14 @@ def generate(
     prompt: str,
     *,
     max_new_tokens: int = 128,
-    temperature: float = 0.8,
+    temperature: float = 0.2,
     top_k: int = 50,
-    top_p: float = 0.9,
+    top_p: float = 0.95,
     repetition_penalty: float = 1.05,
     stop_at_eos: bool = True,
 ) -> str:
-    input_ids: List[int] = tok.encode(prompt, out_type=int)
+    # IMPORTANT: add BOS to match training
+    input_ids: List[int] = tok.encode(prompt, out_type=int, add_bos=True)
     generated: List[int] = []
     ctx = int(cfg.context_size)
 
@@ -171,18 +180,27 @@ def generate(
 
 # ─────────────────────────── CLI entrypoint ─────────────────────────
 def main():
-    ap = argparse.ArgumentParser("OpenELM / MLX inference (fixed RUNS mode)")
-    ap.add_argument("--config", required=True, help="Path to config.json used for training")
+    ap = argparse.ArgumentParser("OpenELM / MLX inference")
+    ap.add_argument("--config", required=True, help="Path to training config.json")
     ap.add_argument("--tokenizer", required=True, help="SentencePiece model file (spm.model)")
     ap.add_argument("--ckpt-dir", default="runs/sml-lm", help="Directory with ckpt_*.safetensors")
     ap.add_argument("--checkpoint", default=None, help="Specific ckpt path (overrides --ckpt-dir)")
     ap.add_argument("--device", choices=["gpu", "cpu"], default="gpu")
 
-    # global knobs (used when a RUN doesn't specify them—here all runs do)
-    ap.add_argument("--max-new", type=int, default=128)
+    # Single-prompt path
+    ap.add_argument("--prompt", default=None, help="If given, run a single prompt instead of built-in RUNS")
+
+    # Sampling knobs
+    ap.add_argument("--max-new", type=int, default=256)
+    ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--repetition-penalty", type=float, default=1.05)
     ap.add_argument("--no-eos-stop", action="store_true", help="Do not stop on EOS token")
+
+    # Repro
     ap.add_argument("--seed", type=int, default=0, help="Set >0 for deterministic sampling")
+
     args = ap.parse_args()
 
     if args.seed and args.seed > 0:
@@ -197,12 +215,8 @@ def main():
     rep = args.repetition_penalty
     mnew = args.max_new
 
-    # Iterate the fixed RUNS list
-    for i, (prompt, temp, top_k, top_p) in enumerate(RUNS, 1):
-        print(f"\n=== Run {i}/{len(RUNS)} ===")
-        print(f"Prompt: {prompt!r}")
-        print(f"temp={temp} top_k={top_k} top_p={top_p} rep={rep} max_new={mnew}")
-
+    def run_one(prompt: str, temp: float, top_k: int, top_p: float):
+        print(f"\nPrompt: {prompt!r}")
         t0 = time.time()
         out = generate(
             model, tok, cfg, prompt,
@@ -214,8 +228,17 @@ def main():
             stop_at_eos=stop_at_eos,
         )
         dt = time.time() - t0
-        print(f"\n--- Completion ({dt:.2f}s) ---")
+        ntoks = len(tok.encode(out, out_type=int))
+        print(f"[infer] gen speed ≈ {ntoks/dt:.1f} tok/s ({ntoks} tokens in {dt:.2f}s)")
         print(out)
+
+    if args.prompt is not None:
+        run_one(args.prompt, args.temperature, args.top_k, args.top_p)
+    else:
+        for i, (prompt, temp, top_k, top_p) in enumerate(RUNS, 1):
+            print(f"\n=== Run {i}/{len(RUNS)} ===")
+            print(f"temp={temp} top_k={top_k} top_p={top_p} rep={rep} max_new={mnew}")
+            run_one(prompt, temp, top_k, top_p)
 
 if __name__ == "__main__":
     main()
