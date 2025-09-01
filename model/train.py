@@ -87,12 +87,12 @@ def _broadcast_scalar_int(value: int, rank: int) -> int:
     return int(out[0])
 
 def _broadcast_params_safe(params, rank: int) -> None:
-    """Broadcast model params from rank 0 using arithmetic ops (Metal-safe)."""
+    max_elems = int(os.getenv("ALLREDUCE_CHUNK_ELEMS", "2000000"))
     def _one(p):
         if not isinstance(p, mx.array):
             return
         src = p if rank == 0 else (p * 0)
-        summed = mx.distributed.all_sum(src)
+        summed = _chunked_all_sum(src, max_elems=max_elems)  # chunked
         p *= 0
         p += summed
     tree_map(_one, params)
@@ -575,6 +575,16 @@ def main():
             # fetch batch and compute loss+grads
             batch = next(train_it)
             loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
+
+            # --- NEW: sync NaN/Inf check across ranks ---
+            bad_local = int(bool(mx.isnan(loss)) or bool(mx.isinf(loss)))
+            # use the existing safe scalar broadcast to sum flags across ranks
+            bad_any = _broadcast_scalar_int(bad_local, rank)
+            if bad_any:
+                if rank == 0:
+                    log(rank, "NaN/Inf on at least one rank — zeroing grads this microstep (lockstep)")
+                # zero grads so every rank runs the same accumulation/update path
+                grads = tree_map(lambda g: mx.zeros_like(g) if isinstance(g, mx.array) else g, grads)
 
             # detect/skip NaN loss
             if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
