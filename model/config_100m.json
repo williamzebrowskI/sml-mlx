@@ -24,7 +24,7 @@
   "weight_decay": 0.01,
   "grad_clip": 0.5,
 
-  "mlx_dtype": "bfloat16",
+  "torch_dtype": "bfloat16",
   "use_fast_sdp": false,
 
   "local_bs": 1,
