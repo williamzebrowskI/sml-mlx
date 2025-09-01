@@ -50,13 +50,11 @@ def _flatten(tree):
         return [tree]
     if isinstance(tree, Mapping):
         out = []
-        for v in tree.values():
-            out += _flatten(v)
+        for v in tree.values(): out += _flatten(v)
         return out
     if isinstance(tree, Sequence) and not isinstance(tree, (str, bytes)):
         out = []
-        for v in tree:
-            out += _flatten(v)
+        for v in tree: out += _flatten(v)
         return out
     return []
 
@@ -79,32 +77,22 @@ def _chunked_all_sum(arr: mx.array, *, max_elems: int) -> mx.array:
 def _tree_all_sum(tree, *, max_elems: int):
     return tree_map(lambda a: _chunked_all_sum(a, max_elems=max_elems) if isinstance(a, mx.array) else a, tree)
 
-# ---------- Safe broadcasts (no indexing like p[...]=...) ----------
+# ---------- Safe broadcasts (no p[...] writes) ----------
 def _broadcast_scalar_int(value: int, rank: int) -> int:
-    # rank 0 contributes value, others contribute 0; sum -> value across ranks
-    try:
-        dtype = mx.int64  # prefer int64 if available
-    except AttributeError:
-        dtype = mx.int32
+    dtype = getattr(mx, "int64", mx.int32)
     a = mx.array([value], dtype=dtype)
     if rank != 0:
         a *= 0
-    out = mx.distributed.all_sum(a)
-    mx.eval(out)
+    out = mx.distributed.all_sum(a); mx.eval(out)
     return int(out[0])
 
 def _broadcast_params_safe(params, rank: int) -> None:
-    """
-    Broadcast model parameters from rank 0 to all ranks without any indexing.
-    Uses in-place arithmetic ops which MLX allows (avoids p[...]=... writes).
-    """
+    """Broadcast model params from rank 0 using arithmetic ops (Metal-safe)."""
     def _one(p):
         if not isinstance(p, mx.array):
             return
-        # Only rank 0 contributes; others contribute zeros
         src = p if rank == 0 else (p * 0)
         summed = mx.distributed.all_sum(src)
-        # Write back into the same buffer without fancy indexing
         p *= 0
         p += summed
     tree_map(_one, params)
@@ -125,21 +113,17 @@ def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code == 429:
                 sleep_for = min(backoff, backoff_max) * (1.0 + random.random())
-                log(rank, f"HF 429 Too Many Requests → sleeping {sleep_for:.1f}s then retrying stream …")
-                time.sleep(sleep_for)
-                backoff = min(backoff * 2.0, backoff_max)
-                continue
+                log(rank, f"HF 429 Too Many Requests → sleep {sleep_for:.1f}s")
+                time.sleep(sleep_for); backoff = min(backoff * 2.0, backoff_max); continue
             if code in {500, 502, 503, 504, None}:
                 sleep_for = 5.0 * (1.0 + 0.5 * random.random())
                 log(rank, f"HF transient {code or 'error'} → backoff {sleep_for:.1f}s")
-                time.sleep(sleep_for)
-                continue
+                time.sleep(sleep_for); continue
             raise
         except Exception as e:
             sleep_for = 5.0 * (1.0 + 0.5 * random.random())
             log(rank, f"dataset iterator error: {type(e).__name__}: {e} → retry in {sleep_for:.1f}s")
-            time.sleep(sleep_for)
-            continue
+            time.sleep(sleep_for); continue
 
 def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
     window, buf = ctx + 1, []
@@ -186,11 +170,11 @@ def get_args():
     p.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
     p.add_argument("--resume", help="Optional: path to a checkpoint file; step will be parsed from its name")
 
-    # 50/50 mixer controls
+    # 50/50 mixer controls (will be ignored if not used)
     p.add_argument("--mix-50-50", action="store_true",
                    help="Use 50/50 text+code mixed stream (ignores --dataset)")
     p.add_argument("--text-ds", default=os.getenv("TEXT_DS", "HuggingFaceFW/fineweb-edu"),
-                   help="HF dataset id for text (used when --mix-50-50)")
+                   help="HF dataset id for text (used when --mix-50-50, or as fallback if --dataset absent)")
     p.add_argument("--text-ds-config", default=os.getenv("TEXT_DS_CONFIG"),
                    help="HF dataset config for text (optional)")
     p.add_argument("--code-ds", default=os.getenv("CODE_DS", "codeparrot/codeparrot-clean"),
@@ -209,6 +193,11 @@ def get_args():
     # also allow env var to toggle mixer / seek behavior
     args.mix_50_50 = args.mix_50_50 or _env_flag("USE_TEXT_CODE_MIX", False)
     args.no_data_seek = args.no_data_seek or _env_flag("NO_DATA_SEEK", False)
+
+    # FineWeb-only convenience: if not mixing and --dataset missing, use --text-ds
+    if not args.mix_50_50 and not args.dataset and args.text_ds:
+        args.dataset = args.text_ds
+        args.dataset_config = args.text_ds_config
 
     # Enforce dataset only if NOT mixing
     if not args.mix_50_50 and not args.dataset:
@@ -272,7 +261,6 @@ def print_effective_config(
 
 # ───────────────────────────────────
 def _parse_step_from_name(path: str) -> int:
-    # accepts ".../ckpt_000123.safetensors" or ".../ckpt_000123_whatever.safetensors"
     m = re.search(r"ckpt_(\d{1,12})", str(path))
     return int(m.group(1)) if m else 0
 
@@ -322,7 +310,6 @@ def main():
     except Exception:
         default_dtype = "n/a"
 
-    # deterministic init option (fresh runs)
     INIT_SEED = int(os.getenv("INIT_SEED", "0"))
     if INIT_SEED:
         mx.random.seed(INIT_SEED)
@@ -412,9 +399,10 @@ def main():
         train_it = itertools.islice(mixed_gen, skip_batches, None)
         log(rank, f"using 50/50 text+code mixed stream; packer ready. skip_batches={skip_batches}")
     else:
+        log(rank, f"TEXT-ONLY mode: dataset={args.dataset} cfg={args.dataset_config or 'None'} split={args.train_split}")
         for attempt in range(1, 6):
             try:
-                log(rank, f"loading dataset {args.dataset} cfg={args.dataset_config} split={args.train_split} (streaming=True) try {attempt}/5")
+                log(rank, f"loading dataset {args.dataset} (streaming=True) try {attempt}/5")
                 ds = load_dataset(
                     args.dataset,
                     args.dataset_config,
@@ -453,7 +441,6 @@ def main():
     if rank == 0:
         chosen_path = None
         if args.resume:
-            # If user supplied a path, try that; parse step if possible
             chosen_path = pathlib.Path(args.resume)
             if chosen_path.exists():
                 loaded_ckpt_step = _parse_step_from_name(str(chosen_path))
@@ -477,14 +464,10 @@ def main():
         else:
             log(rank, "no checkpoint found; starting fresh")
 
-    # Make sure every rank sees the same start_step (for LR schedule)
     start_step = _broadcast_scalar_int(int(loaded_ckpt_step), rank)
-
-    # Broadcast parameters from rank 0 → all ranks (no checkpoints on other machines)
     _barrier()
     _broadcast_params_safe(model.parameters(), rank)
     _barrier()
-
     log(rank, f"weights synced – entering compile (start_step={start_step})")
 
     # numerically-stable loss (logits upcast to fp32)
@@ -513,9 +496,6 @@ def main():
     _ = value_and_grad(model, _dummy); mx.eval(_)
     log(rank, "compile done; starting training loop")
 
-    # if rank == 0:
-    #     wandb.init(...)
-
     def compute_grad_norm(tree) -> float:
         flats = [g for g in _flatten(tree) if isinstance(g, mx.array)]
         return (sum(float((g**2).sum()) for g in flats) ** 0.5) if flats else 0.0
@@ -538,7 +518,6 @@ def main():
         signal.signal(signal.SIGTERM, _handle)
 
     # helper to persist state (ckpt + meta + offset)
-    out_dir.mkdir(parents=True, exist_ok=True)
     def save_state(step: int, tag: str | None = None):
         if rank != 0:
             return
