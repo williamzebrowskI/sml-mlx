@@ -1,11 +1,11 @@
 {
   "vocab_size": 28000,
-  "num_transformer_layers": 10,
-  "model_dim": 768,
+  "num_transformer_layers": 6,
+  "model_dim": 512,
   "num_heads": 12,
   "head_dim": 64,
 
-  "ffn_multipliers": [3,3,3,3,3,3,3,3,3,3],
+  "ffn_multipliers": [3, 3, 3, 3, 3, 3],
   "ffn_dim_divisor": 256,
   "ffn_with_glu": true,
 
@@ -25,10 +25,29 @@
   "grad_clip": 0.5,
 
   "mlx_dtype": "bfloat16",
-  "tokenizer_path": "tokenizer/fineweb_spm/spm.model",
-  "checkpoint_dir": "runs/sml-lm",
   "use_fast_sdp": false,
 
   "local_bs": 1,
-  "accum_steps": 16
+  "accum_steps": 16,
+
+  "tokenizer_path": "tokenizer/fineweb_spm/spm.model",
+  "checkpoint_dir": "runs/sml-lm",
+
+
+  "mix_50_50": false,
+  "dataset": "HuggingFaceFW/fineweb-edu",
+  "dataset_config": null,
+  "train_split": "train",
+  "text_ds": "HuggingFaceFW/fineweb-edu",
+  "text_ds_config": null,
+  "code_ds": "codeparrot/codeparrot-clean",
+  "code_ds_config": null,
+  "code_licenses": "",
+
+  "no_data_seek": false,
+
+  "shuffle_buffer": 20000,
+  "hf_backoff_max": 60,
+  "rank_stagger_sec": null,
+  "allreduce_chunk_elems": 2000000
 }

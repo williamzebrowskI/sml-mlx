@@ -159,51 +159,29 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def get_args():
     p = argparse.ArgumentParser("OpenSML MLX trainer")
     p.add_argument("--config", required=True)
-    p.add_argument("--tokenizer", required=True)
+    p.add_argument("--tokenizer", required=False)   # now optional; falls back to config
+    p.add_argument("--out", required=False)         # now optional; falls back to config
 
-    # Make --dataset optional; required only when not using the mixer
-    p.add_argument("--dataset", required=False, help="HF dataset id (streaming)")
-    p.add_argument("--dataset-config", default=None, help="HF dataset config name")
-    p.add_argument("--train-split", default="train", help="split or slice, e.g. 'train', 'train[:1%]'")
+    # Dataset flags remain optional and override config if provided
+    p.add_argument("--dataset", required=False)
+    p.add_argument("--dataset-config", default=None)
+    p.add_argument("--train-split", default=None)
 
-    p.add_argument("--out", required=True)
     p.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
-    p.add_argument("--resume", help="Optional: path to a checkpoint file; step will be parsed from its name")
+    p.add_argument("--resume", help="Optional: path to a checkpoint file")
 
-    # 50/50 mixer controls (will be ignored if not used)
-    p.add_argument("--mix-50-50", action="store_true",
-                   help="Use 50/50 text+code mixed stream (ignores --dataset)")
-    p.add_argument("--text-ds", default=os.getenv("TEXT_DS", "HuggingFaceFW/fineweb-edu"),
-                   help="HF dataset id for text (used when --mix-50-50, or as fallback if --dataset absent)")
-    p.add_argument("--text-ds-config", default=os.getenv("TEXT_DS_CONFIG"),
-                   help="HF dataset config for text (optional)")
-    p.add_argument("--code-ds", default=os.getenv("CODE_DS", "codeparrot/codeparrot-clean"),
-                   help="HF dataset id for code (used when --mix-50-50)")
-    p.add_argument("--code-ds-config", default=os.getenv("CODE_DS_CONFIG"),
-                   help="HF dataset config for code (optional)")
-    p.add_argument("--code-licenses", default=os.getenv("CODE_LICENSES", ""),
-                   help="Comma-separated allowlist for code licenses (substring match). Empty=allow all.")
+    # Mixer flags (optional overrides)
+    p.add_argument("--mix-50-50", action="store_true")
+    p.add_argument("--text-ds", default=None)
+    p.add_argument("--text-ds-config", default=None)
+    p.add_argument("--code-ds", default=None)
+    p.add_argument("--code-ds-config", default=None)
+    p.add_argument("--code-licenses", default=None)
 
-    # resume data-position handling
-    p.add_argument("--no-data-seek", action="store_true",
-                   help="Do NOT fast-forward the stream to match previous token offset on resume.")
+    # Resume data-position handling (optional override)
+    p.add_argument("--no-data-seek", action="store_true")
 
-    args = p.parse_args()
-
-    # also allow env var to toggle mixer / seek behavior
-    args.mix_50_50 = args.mix_50_50 or _env_flag("USE_TEXT_CODE_MIX", False)
-    args.no_data_seek = args.no_data_seek or _env_flag("NO_DATA_SEEK", False)
-
-    # FineWeb-only convenience: if not mixing and --dataset missing, use --text-ds
-    if not args.mix_50_50 and not args.dataset and args.text_ds:
-        args.dataset = args.text_ds
-        args.dataset_config = args.text_ds_config
-
-    # Enforce dataset only if NOT mixing
-    if not args.mix_50_50 and not args.dataset:
-        p.error("--dataset is required unless --mix-50-50 is set")
-
-    return args
+    return p.parse_args()
 
 # ───────────────────────────────────
 def print_effective_config(
@@ -285,7 +263,56 @@ def main():
     log(rank, f"init OK ({rank+1}/{size}) on host {socket.gethostname()}")
 
     args = get_args()
-    cfg = SMLMConfig.from_json(args.config)
+
+    # Load raw JSON (for trainer/runtime knobs) alongside model cfg
+    cfg_path = pathlib.Path(args.config)
+    raw_cfg = json.loads(cfg_path.read_text())
+
+    cfg = SMLMConfig.from_json(args.config)  # model hyperparams live here
+
+    # ----- Resolve paths from CLI > config -----
+    args.tokenizer = args.tokenizer or raw_cfg.get("tokenizer_path")
+    args.out = args.out or raw_cfg.get("checkpoint_dir")
+
+    if not args.tokenizer:
+        raise ValueError("No tokenizer provided: set --tokenizer or config['tokenizer_path']")
+    if not args.out:
+        raise ValueError("No output dir provided: set --out or config['checkpoint_dir']")
+
+    # ----- Mixer / dataset selection: CLI overrides config -----
+    use_mix = args.mix_50_50 or bool(raw_cfg.get("mix_50_50", False))
+
+    # canonical dataset fields (None means 'use config')
+    dataset = args.dataset if args.dataset is not None else raw_cfg.get("dataset")
+    dataset_cfg = args.dataset_config if args.dataset_config is not None else raw_cfg.get("dataset_config")
+    train_split = args.train_split if args.train_split is not None else raw_cfg.get("train_split", "train")
+
+    text_ds = args.text_ds or raw_cfg.get("text_ds")
+    text_ds_cfg = args.text_ds_config or raw_cfg.get("text_ds_config")
+    code_ds = args.code_ds or raw_cfg.get("code_ds")
+    code_ds_cfg = args.code_ds_config or raw_cfg.get("code_ds_config")
+    code_licenses = (args.code_licenses if args.code_licenses is not None else raw_cfg.get("code_licenses", "")) or ""
+
+    # enforce: when NOT mixing, dataset must be known (fall back to text_ds)
+    if not use_mix and not dataset:
+        dataset = text_ds or "HuggingFaceFW/fineweb-edu"
+
+    # ----- Resume stream behavior -----
+    no_data_seek = args.no_data_seek or bool(raw_cfg.get("no_data_seek", False))
+
+    # ----- Runtime knobs (no env needed) -----
+    LOCAL_BS = int(raw_cfg.get("local_bs", getattr(cfg, "local_bs", 1)))
+    ACCUM_STEPS = int(raw_cfg.get("accum_steps", getattr(cfg, "accum_steps", 1)))
+    SHUFFLE_BUF = int(raw_cfg.get("shuffle_buffer", 20000))
+    BACKOFF_MAX = float(raw_cfg.get("hf_backoff_max", 60))
+    ALLREDUCE_CHUNK_ELEMS = int(raw_cfg.get("allreduce_chunk_elems", 2_000_000))
+
+    # rank stagger: explicit number or default rank*2.0 (set later once rank known)
+    # we stash the raw value for now:
+    RANK_STAGGER_SEC_CFG = raw_cfg.get("rank_stagger_sec", None)
+
+    # DType: honor mlx_dtype or torch_dtype in config
+    dtype_str = (raw_cfg.get("mlx_dtype") or raw_cfg.get("torch_dtype") or getattr(cfg, "torch_dtype", None))
 
     # Optional HF token
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
@@ -300,10 +327,11 @@ def main():
 
     # device & default dtype
     mx.set_default_device(mx.gpu if args.device == "gpu" else mx.cpu)
-    if hasattr(mx, "set_default_dtype"):
-        if cfg.torch_dtype in ("float16", "fp16"):
+    if hasattr(mx, "set_default_dtype") and dtype_str:
+        ds = str(dtype_str).lower()
+        if ds in ("float16", "fp16"):
             mx.set_default_dtype(mx.float16)
-        elif cfg.torch_dtype == "bfloat16":
+        elif ds in ("bfloat16", "bf16"):
             mx.set_default_dtype(mx.bfloat16)
     try:
         default_dtype = mx.default_dtype()
@@ -328,13 +356,7 @@ def main():
     pad_id = pad_tok if pad_tok >= 0 else -100
     log(rank, f"tokenizer loaded. vocab={vocab_from_sp} pad_id={pad_tok}")
 
-    # micro-batch & accumulation (can override via env)
-    LOCAL_BS = int(os.getenv("LOCAL_BS", cfg.local_bs))
-    ACCUM_STEPS = int(os.getenv("ACCUM_STEPS", cfg.accum_steps))
-    SHUFFLE_BUF = int(os.getenv("SHUFFLE_BUFFER", 20000))
-    BACKOFF_MAX = float(os.getenv("HF_BACKOFF_MAX", "60"))
-    STAGGER = float(os.getenv("RANK_STAGGER_SEC", str(rank * 2.0)))
-    ALLREDUCE_CHUNK_ELEMS = int(os.getenv("ALLREDUCE_CHUNK_ELEMS", "2000000"))
+    STAGGER = (float(RANK_STAGGER_SEC_CFG) if RANK_STAGGER_SEC_CFG is not None else (rank * 2.0))
 
     # Per-rank config dump
     print_effective_config(
@@ -363,7 +385,7 @@ def main():
     offset_file = out_dir / "offset.txt"
 
     # seek/offset
-    if args.no_data_seek:
+    if no_data_seek:
         offset = 0
         log(rank, "NO_DATA_SEEK active → not fast-forwarding the dataset stream.")
     else:
@@ -384,29 +406,29 @@ def main():
     # ─────────────── build dataset iterator(s) ───────────────
     download_config = DownloadConfig(max_retries=5)
 
-    if args.mix_50_50:
-        allow = {x.strip().lower() for x in (args.code_licenses or "").split(",") if x.strip()}
-        log(rank, f"building 50/50 stream | text={args.text_ds} code={args.code_ds} licenses={sorted(list(allow)) or 'none'}")
+    if use_mix:
+        allow = {x.strip().lower() for x in (code_licenses or "").split(",") if x.strip()}
+        log(rank, f"building 50/50 stream | text={text_ds} code={code_ds} licenses={sorted(list(allow)) or 'none'}")
         mixed_gen = build_50_50_stream(
             rank=rank, size=size,
             ctx_len=cfg.context_size, bs=LOCAL_BS,
             sp_model_path=args.tokenizer,
-            text_ds_id=args.text_ds, code_ds_id=args.code_ds,
-            text_cfg=args.text_ds_config, code_cfg=args.code_ds_config,
+            text_ds_id=text_ds, code_ds_id=code_ds,
+            text_cfg=text_ds_cfg, code_cfg=code_ds_cfg,
             shuffle_buffer=SHUFFLE_BUF,
             allow_code_licenses=allow if allow else None,
         )
         train_it = itertools.islice(mixed_gen, skip_batches, None)
         log(rank, f"using 50/50 text+code mixed stream; packer ready. skip_batches={skip_batches}")
     else:
-        log(rank, f"TEXT-ONLY mode: dataset={args.dataset} cfg={args.dataset_config or 'None'} split={args.train_split}")
+        log(rank, f"TEXT-ONLY mode: dataset={dataset} cfg={dataset_cfg or 'None'} split={train_split}")
         for attempt in range(1, 6):
             try:
-                log(rank, f"loading dataset {args.dataset} (streaming=True) try {attempt}/5")
+                log(rank, f"loading dataset {dataset} (streaming=True) try {attempt}/5")
                 ds = load_dataset(
-                    args.dataset,
-                    args.dataset_config,
-                    split=args.train_split,
+                    dataset,
+                    dataset_cfg,
+                    split=train_split,
                     streaming=True,
                     download_config=download_config,
                     trust_remote_code=True,
