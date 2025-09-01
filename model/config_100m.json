@@ -1,11 +1,11 @@
 {
   "vocab_size": 50096,
   "num_transformer_layers": 10,
-  "model_dim": 512,
-  "num_heads": 8,
+  "model_dim": 768,
+  "num_heads": 12,
   "head_dim": 64,
 
-  "ffn_multipliers": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+  "ffn_multipliers": [3,3,3,3,3,3,3,3,3,3],
   "ffn_dim_divisor": 256,
   "ffn_with_glu": true,
 
