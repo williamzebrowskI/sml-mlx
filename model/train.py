@@ -1,6 +1,7 @@
 # model/train.py
 # MLX distributed trainer with robust HF streaming, optional 50/50 mixer,
-# per-rank checkpoint loading (no in-place param broadcast), and chunked all-reduce.
+# single-rank checkpoint load (rank 0) + safe broadcast of weights/start_step,
+# and chunked all-reduce for gradients to avoid Metal GPU timeouts.
 
 from __future__ import annotations
 import argparse, pathlib, math, json, time, itertools, socket, os, random, signal, platform, re
@@ -49,11 +50,13 @@ def _flatten(tree):
         return [tree]
     if isinstance(tree, Mapping):
         out = []
-        for v in tree.values(): out += _flatten(v)
+        for v in tree.values():
+            out += _flatten(v)
         return out
     if isinstance(tree, Sequence) and not isinstance(tree, (str, bytes)):
         out = []
-        for v in tree: out += _flatten(v)
+        for v in tree:
+            out += _flatten(v)
         return out
     return []
 
@@ -75,6 +78,36 @@ def _chunked_all_sum(arr: mx.array, *, max_elems: int) -> mx.array:
 
 def _tree_all_sum(tree, *, max_elems: int):
     return tree_map(lambda a: _chunked_all_sum(a, max_elems=max_elems) if isinstance(a, mx.array) else a, tree)
+
+# ---------- Safe broadcasts (no indexing like p[...]=...) ----------
+def _broadcast_scalar_int(value: int, rank: int) -> int:
+    # rank 0 contributes value, others contribute 0; sum -> value across ranks
+    try:
+        dtype = mx.int64  # prefer int64 if available
+    except AttributeError:
+        dtype = mx.int32
+    a = mx.array([value], dtype=dtype)
+    if rank != 0:
+        a *= 0
+    out = mx.distributed.all_sum(a)
+    mx.eval(out)
+    return int(out[0])
+
+def _broadcast_params_safe(params, rank: int) -> None:
+    """
+    Broadcast model parameters from rank 0 to all ranks without any indexing.
+    Uses in-place arithmetic ops which MLX allows (avoids p[...]=... writes).
+    """
+    def _one(p):
+        if not isinstance(p, mx.array):
+            return
+        # Only rank 0 contributes; others contribute zeros
+        src = p if rank == 0 else (p * 0)
+        summed = mx.distributed.all_sum(src)
+        # Write back into the same buffer without fancy indexing
+        p *= 0
+        p += summed
+    tree_map(_one, params)
 
 # ───────────────────────────────────
 def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: str):
@@ -415,47 +448,44 @@ def main():
     model = OpenELM(cfg)
     opt = optim.AdamW(cfg.max_lr, betas=(0.9, 0.98), eps=1e-8, weight_decay=cfg.weight_decay)
 
-    # ───── resume: pick a step on rank0 → broadcast step → each rank loads ckpt_{step}
-    resume_step = 0
+    # ───── resume: rank 0 decides step & loads weights → broadcast step & params
+    loaded_ckpt_step = 0
     if rank == 0:
+        chosen_path = None
         if args.resume:
-            resume_step = _parse_step_from_name(args.resume)
-            if resume_step == 0:
-                log(rank, f"could not parse step from --resume {args.resume}; ignoring")
+            # If user supplied a path, try that; parse step if possible
+            chosen_path = pathlib.Path(args.resume)
+            if chosen_path.exists():
+                loaded_ckpt_step = _parse_step_from_name(str(chosen_path))
+                if loaded_ckpt_step == 0:
+                    log(rank, f"--resume provided but step unparsable: {args.resume}")
             else:
-                log(rank, f"--resume provided; using step {resume_step}")
-        if resume_step == 0:
+                log(rank, f"--resume path not found: {args.resume}")
+                chosen_path = None
+
+        if chosen_path is None:
             ckpt, step = _find_latest_ckpt(out_dir)
             if ckpt is not None and step > 0:
-                resume_step = step
-                log(rank, f"auto-resume: latest {ckpt.name} (step {step})")
-        # broadcast by all-sum (others add 0)
-        b = mx.array([resume_step], dtype=mx.int32)
-    else:
-        b = mx.array([0], dtype=mx.int32)
+                chosen_path = ckpt
+                loaded_ckpt_step = step
+                log(rank, f"auto-resume from {ckpt.name} (step {step})")
 
-    resume_step = int(mx.distributed.all_sum(b)[0])
+        if chosen_path is not None:
+            log(rank, f"loading weights on rank 0 from {str(chosen_path)}")
+            model.load_weights(str(chosen_path))
+            mx.eval(model.parameters())
+        else:
+            log(rank, "no checkpoint found; starting fresh")
+
+    # Make sure every rank sees the same start_step (for LR schedule)
+    start_step = _broadcast_scalar_int(int(loaded_ckpt_step), rank)
+
+    # Broadcast parameters from rank 0 → all ranks (no checkpoints on other machines)
+    _barrier()
+    _broadcast_params_safe(model.parameters(), rank)
     _barrier()
 
-    start_step = int(resume_step)
-    if resume_step > 0:
-        # preferred local ckpt path (requires the file to exist on each host)
-        local_ckpt = out_dir / f"ckpt_{resume_step:06d}.safetensors"
-        load_path = None
-        if local_ckpt.exists():
-            load_path = str(local_ckpt)
-        elif args.resume and pathlib.Path(args.resume).exists():
-            load_path = args.resume  # fallback to exact path if available here
-        if load_path is None:
-            raise FileNotFoundError(
-                f"Resume step {resume_step} chosen, but neither {local_ckpt} nor {args.resume or '(none)'} exists on this host. "
-                f"Copy ckpt_{resume_step:06d}.safetensors to {out_dir} on every Mac."
-            )
-        log(rank, f"loading weights from {load_path}")
-        model.load_weights(load_path)
-        mx.eval(model.parameters())
-
-    log(rank, f"weights ready – entering compile (start_step={start_step})")
+    log(rank, f"weights synced – entering compile (start_step={start_step})")
 
     # numerically-stable loss (logits upcast to fp32)
     def loss_fn(m, batch):
@@ -508,6 +538,7 @@ def main():
         signal.signal(signal.SIGTERM, _handle)
 
     # helper to persist state (ckpt + meta + offset)
+    out_dir.mkdir(parents=True, exist_ok=True)
     def save_state(step: int, tag: str | None = None):
         if rank != 0:
             return
@@ -529,7 +560,7 @@ def main():
 
     try:
         for global_step in range(start_step + 1, cfg.max_iterations + 1):
-            # LR schedule
+            # LR schedule (short warm restart after resume)
             if global_step < start_step + RESTART_WARM:
                 opt.learning_rate = cfg.max_lr * (global_step - start_step) / max(1, RESTART_WARM)
             else:
@@ -547,7 +578,7 @@ def main():
             # detect/skip NaN loss
             if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
                 if rank == 0:
-                    x, y = batch[:, :-1], batch[:, 1:]
+                    y = batch[:, 1:]
                     valid_sum = (y != pad_id).sum() if pad_id >= 0 else y.size
                     log(rank, f"⚠️ NaN/Inf loss detected. valid_sum={valid_sum}")
                 continue
