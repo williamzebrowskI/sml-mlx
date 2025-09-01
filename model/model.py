@@ -30,7 +30,7 @@ class SMLMConfig:
     rope_max_length: int = 2048
     normalization_layer_name: str = "rmsnorm"
     activation_fn_name: str = "silu"
-    context_size: int = 2048
+    context_size: int = 512
     share_input_output_layers: bool = True
     use_fast_sdp: bool = True
     dropout: float = 0.0
@@ -79,7 +79,7 @@ class SMLMConfig:
             weight_decay=float(raw.get("weight_decay", 0.1)),
             grad_clip=float(raw.get("grad_clip", 1.0)),
             torch_dtype=str(raw.get("torch_dtype", raw.get("mlx_dtype", "float16"))),
-            local_bs=int(raw.get("local_bs", 4)),
+            local_bs=int(raw.get("local_bs", 1)),
             accum_steps=int(raw.get("accum_steps", 16)),
             tokenizer_path=str(raw.get("tokenizer_path", "")),
             checkpoint_dir=str(raw.get("checkpoint_dir", "runs/sml-lm")),

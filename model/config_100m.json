@@ -2,7 +2,7 @@
   "vocab_size": 28000,
   "num_transformer_layers": 6,
   "model_dim": 512,
-  "num_heads": 12,
+  "num_heads": 8,
   "head_dim": 64,
 
   "ffn_multipliers": [3, 3, 3, 3, 3, 3],
