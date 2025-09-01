@@ -1,65 +1,85 @@
-# data_mixer.py
+# model/data_mixer.py
+# Robust 50/50 text+code streaming mixer for HF streaming datasets
+# - No reliance on .features (which can be None in streaming)
+# - Auto-detects text/code field names per example
+# - Per-rank shard + shuffle, optional license filter
+# - Alternates TEXT batch, then CODE batch (≈50/50 by batches)
+
 from __future__ import annotations
-import os, time, random
-from typing import Iterator, Dict, Any
+import itertools, random, time
+from typing import Iterator, Optional, Set, Dict, Any
+
 import numpy as np
+import mlx.core as mx
 import sentencepiece as spm
 from datasets import load_dataset, DownloadConfig
-from huggingface_hub.utils import HfHubHTTPError
 
-import mlx.core as mx
 
-def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
+def _resilient_iter(ds, rank: int, backoff_max: float = 60.0):
+    """Yield examples from a streaming dataset, retrying on transient errors."""
     backoff = 2.0
     while True:
         it = iter(ds)
         try:
             for ex in it:
                 yield ex
-        except HfHubHTTPError as e:
-            code = getattr(getattr(e, "response", None), "status_code", None)
-            if code == 429:
-                sleep_for = min(backoff, backoff_max) * (1.0 + random.random())
-                print(f"[{time.strftime('%H:%M:%S')}] [Rank {rank}] HF 429 → sleep {sleep_for:.1f}s", flush=True)
-                time.sleep(sleep_for)
-                backoff = min(backoff * 2.0, backoff_max)
-                continue
-            if code in {500, 502, 503, 504, None}:
-                time.sleep(5.0 * (1.0 + 0.5 * random.random()))
-                continue
-            raise
-        except Exception:
-            time.sleep(5.0 * (1.0 + 0.5 * random.random()))
+            # If the stream ends, restart it
+        except Exception as e:
+            sleep_for = min(backoff, backoff_max) * (1.0 + 0.5 * random.random())
+            print(f"[data_mixer][Rank {rank}] stream hiccup {type(e).__name__}: {e} → sleep {sleep_for:.1f}s", flush=True)
+            time.sleep(sleep_for)
+            backoff = min(backoff * 2.0, backoff_max)
             continue
 
-def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: str):
-    ids = sp.encode(example[key], out_type=int, add_bos=True, add_eos=True)
-    return {"ids": ids}
 
-def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
-    window, buf = ctx + 1, []
-    while True:
-        for ex in dataset_iter:
-            buf.extend(ex["ids"])
-            while len(buf) >= window * bs:
-                chunk = np.asarray(buf[: window * bs], dtype=np.int32)
-                del buf[: window * bs]
-                yield mx.array(chunk).reshape(bs, window)
+def _extract_text(ex: Dict[str, Any], prefer_code: bool) -> str:
+    """Pick the best string field to tokenize without relying on .features."""
+    if not isinstance(ex, dict):
+        return str(ex)
 
-def interleave_batches(gens: Dict[str, Iterator[mx.array]], weights: Dict[str, float]):
-    # deterministic cycling by integer batch counts per "epoch" of K batches
-    keys = list(gens.keys())
-    tot = sum(weights.values())
-    counts = {k: max(1, int(round(1000 * (weights[k] / tot)))) for k in keys}
-    order = []
-    for k in keys:
-        order += [k] * counts[k]
-    # simple round-robin over this fixed order
-    i = 0
-    while True:
-        k = order[i]
-        i = (i + 1) % len(order)
-        yield next(gens[k])
+    # Heuristics: prioritize typical fields for each domain, then fall back to any string
+    code_first = ["content", "code", "clean_code", "completion", "target", "docstring", "text"]
+    text_first = ["text", "content", "document", "body", "paragraph", "content_text"]
+    primary = code_first if prefer_code else text_first
+    secondary = text_first if prefer_code else code_first
+
+    for k in primary + secondary:
+        v = ex.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+
+    # Some datasets nest strings under other names; fall back to the first non-empty string value
+    for v in ex.values():
+        if isinstance(v, str) and v.strip():
+            return v
+
+    return ""
+
+
+def _pack_stream(
+    ds_iter: Iterator[Dict[str, Any]],
+    sp: spm.SentencePieceProcessor,
+    ctx: int,
+    bs: int,
+    *,
+    prefer_code: bool,
+) -> Iterator[mx.array]:
+    """Tokenize + pack into fixed (bs, ctx+1) windows."""
+    window = ctx + 1
+    buf: list[int] = []
+    for ex in ds_iter:
+        txt = _extract_text(ex, prefer_code=prefer_code)
+        if not txt:
+            continue
+        ids = sp.encode(txt, out_type=int, add_bos=True, add_eos=True)
+        if not ids:
+            continue
+        buf.extend(ids)
+        while len(buf) >= window * bs:
+            arr = np.asarray(buf[: window * bs], dtype=np.int32)
+            del buf[: window * bs]
+            yield mx.array(arr).reshape(bs, window)
+
 
 def build_50_50_stream(
     *,
@@ -70,41 +90,55 @@ def build_50_50_stream(
     sp_model_path: str,
     text_ds_id: str,
     code_ds_id: str,
+    text_cfg: Optional[str] = None,
+    code_cfg: Optional[str] = None,
     text_split: str = "train",
     code_split: str = "train",
-    text_cfg: str | None = None,
-    code_cfg: str | None = None,
-    shuffle_buffer: int = 20000,
-    allow_code_licenses: set[str] | None = None,
-):
-    sp = spm.SentencePieceProcessor(model_file=sp_model_path)
-
+    shuffle_buffer: int = 20_000,
+    allow_code_licenses: Optional[Set[str]] = None,
+) -> Iterator[mx.array]:
+    """
+    Infinite generator of (bs, ctx_len+1) batches, alternating one TEXT batch
+    then one CODE batch. Works with streaming datasets that have features=None.
+    """
     dlcfg = DownloadConfig(max_retries=5)
 
-    # TEXT stream
-    text = load_dataset(text_ds_id, text_cfg, split=text_split, streaming=True, download_config=dlcfg, trust_remote_code=True)
-    text = text.map(lambda ex: encode_sp(ex, sp=sp, key="text"))
-    text = text.shard(num_shards=size, index=rank, contiguous=True)
-    text = text.shuffle(seed=42 + rank, buffer_size=shuffle_buffer)
-    text_iter = resilient_dataset_iter(text, rank)
-    gen_text = sample_generator(text_iter, ctx_len, bs)
+    text = load_dataset(
+        text_ds_id, text_cfg, split=text_split, streaming=True,
+        download_config=dlcfg, trust_remote_code=True
+    )
+    code = load_dataset(
+        code_ds_id, code_cfg, split=code_split, streaming=True,
+        download_config=dlcfg, trust_remote_code=True
+    )
 
-    # CODE stream
-    code = load_dataset(code_ds_id, code_cfg, split=code_split, streaming=True, download_config=dlcfg, trust_remote_code=True)
-    # (Optional) license filter if the code dataset exposes a license field.
-    if allow_code_licenses is not None:
-        def _ok(ex):
-            lic = (ex.get("license") or ex.get("licenses") or "").lower()
-            return any(x in lic for x in allow_code_licenses)
-        code = code.filter(_ok)
-    # choose the text field; many code sets use "content" or "text"
-    text_key = "content" if "content" in code.features else "text"
-    code = code.map(lambda ex: encode_sp(ex, sp=sp, key=text_key))
-    code = code.shard(num_shards=size, index=rank, contiguous=True)
-    code = code.shuffle(seed=1337 + rank, buffer_size=shuffle_buffer)
-    code_iter = resilient_dataset_iter(code, rank)
-    gen_code = sample_generator(code_iter, ctx_len, bs)
+    # Per-rank shard + shuffle (contiguous to keep order chunks intact)
+    text = text.shard(num_shards=size, index=rank, contiguous=True).shuffle(seed=1234 + rank, buffer_size=shuffle_buffer)
+    code = code.shard(num_shards=size, index=rank, contiguous=True).shuffle(seed=5678 + rank, buffer_size=shuffle_buffer)
 
-    # 50/50 by batches → ≈50/50 by tokens (since batches are same size)
-    mix = interleave_batches({"text": gen_text, "code": gen_code}, {"text": 0.5, "code": 0.5})
-    return mix
+    # Optional license filter for code (only if allow list is provided and field exists)
+    if allow_code_licenses:
+        allowed = {s.lower() for s in allow_code_licenses}
+        def keep(ex):
+            for k in ("license", "licenses", "licence", "license_name"):
+                v = ex.get(k)
+                if isinstance(v, str) and any(a in v.lower() for a in allowed):
+                    return True
+            # If no license field, drop it (conservative) — comment next line to allow all
+            return False
+        code = code.filter(keep)
+
+    it_text = _resilient_iter(text, rank)
+    it_code = _resilient_iter(code, rank)
+
+    sp = spm.SentencePieceProcessor(model_file=sp_model_path)
+
+    gen_text = _pack_stream(it_text, sp, ctx_len, bs, prefer_code=False)
+    gen_code = _pack_stream(it_code, sp, ctx_len, bs, prefer_code=True)
+
+    # Alternate forever; if one side is temporarily empty, yield from the other
+    for tbatch, cbatch in itertools.zip_longest(gen_text, gen_code):
+        if tbatch is not None:
+            yield tbatch
+        if cbatch is not None:
+            yield cbatch
