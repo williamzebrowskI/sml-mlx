@@ -345,7 +345,7 @@ def main():
     meta_path = out_dir / "meta.json"
     offset_file = out_dir / "offset.txt"
 
-    # auto-resume checkpoint discovery (rank 0 loads, then broadcast)
+    # helper: discover latest ckpt and parse step
     def find_latest_ckpt(p: pathlib.Path) -> Tuple[Optional[pathlib.Path], int]:
         cands = list(p.glob("ckpt_*.safetensors"))
         if not cands:
@@ -360,37 +360,7 @@ def main():
         latest = max(cands, key=step_of)
         return latest, step_of(latest)
 
-    start_step = 0
-    loaded_ckpt_step = 0
-    ckpt_path_to_load = None
-
-    if args.resume:
-        ckpt_path_to_load = args.resume
-
-    elif out_dir.exists() and rank == 0:
-        ckpt, ckpt_step = find_latest_ckpt(out_dir)
-        if ckpt is not None:
-            ckpt_path_to_load = str(ckpt)
-            loaded_ckpt_step = ckpt_step
-            log(rank, f"auto-resume from {ckpt.name} (step {ckpt_step})")
-
-    # load on rank 0 if we found a ckpt, then broadcast params
-    if ckpt_path_to_load and rank == 0:
-        try:
-            model_tmp = OpenELM(cfg)
-            model_tmp.load_weights(ckpt_path_to_load)
-            mx.eval(model_tmp.parameters())
-            # swap into 'model' after we instantiate the same architecture below
-            weights_to_broadcast = model_tmp.parameters()
-        except Exception as e:
-            log(rank, f"resume load failed: {e!r}")
-            ckpt_path_to_load = None
-            weights_to_broadcast = None
-    else:
-        weights_to_broadcast = None
-
     # offset handling for restarts (data position)
-    # If --no-data-seek (or NO_DATA_SEEK=1), we IGNORE offset and start reading fresh stream.
     if args.no_data_seek:
         offset = 0
         log(rank, "NO_DATA_SEEK active → not fast-forwarding the dataset stream.")
@@ -461,19 +431,34 @@ def main():
     model = OpenELM(cfg)
     opt = optim.AdamW(cfg.max_lr, betas=(0.9, 0.98), eps=1e-8, weight_decay=cfg.weight_decay)
 
-    # If rank 0 loaded weights, copy them into 'model' and broadcast chunked
-    if ckpt_path_to_load and rank == 0 and weights_to_broadcast is not None:
-        # copy params into our 'model'
-        src, dst = weights_to_broadcast, model.parameters()
-        def _copy(a, b):
-            if isinstance(a, mx.array) and isinstance(b, mx.array) and a.shape == b.shape:
-                b[...] = a
-            return b
-        tree_map(_copy, src, dst)
+    # ───── resume weights: load on rank 0 → broadcast to all (chunked)
+    start_step = 0
+    ckpt_path_to_load: Optional[str] = None
+    if args.resume:
+        ckpt_path_to_load = args.resume
+    else:
+        if out_dir.exists() and rank == 0:
+            ckpt, ckpt_step = find_latest_ckpt(out_dir)
+            if ckpt is not None:
+                ckpt_path_to_load = str(ckpt)
+                start_step = ckpt_step
+                log(rank, f"auto-resume from {ckpt.name} (step {ckpt_step})")
+
+    if ckpt_path_to_load and rank == 0:
+        try:
+            model.load_weights(ckpt_path_to_load)
+            if start_step == 0 and meta_path.exists():
+                # prefer meta only if filename didn't give us a step
+                start_step = int(json.loads(meta_path.read_text()).get("global_step", 0))
+            mx.eval(model.parameters())
+        except Exception as e:
+            log(rank, f"resume load failed: {e!r}")
+            start_step = 0
+            ckpt_path_to_load = None
 
     _barrier()
+    ALLREDUCE_CHUNK_ELEMS = int(os.getenv("ALLREDUCE_CHUNK_ELEMS", str(2_000_000)))
     _broadcast_params_chunked(model.parameters(), rank, max_elems=ALLREDUCE_CHUNK_ELEMS)
-    start_step = int(loaded_ckpt_step) if ckpt_path_to_load else 0
     log(rank, f"weights synced – entering compile (start_step={start_step})")
 
     # numerically-stable loss (logits upcast to fp32)
