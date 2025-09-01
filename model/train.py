@@ -700,17 +700,21 @@ def get_args():
                    help="HF dataset id for text (used when --mix-50-50)")
     p.add_argument("--text-ds-config", default=os.getenv("TEXT_DS_CONFIG"),
                    help="HF dataset config for text (optional)")
-    p.add_argument("--code-ds", default=os.getenv("CODE_DS", "bigcode/the-stack"),
-                   help="HF dataset id for code (used when --mix-50-50)")
+
+    # Switched to a public, non-gated code dataset by default
+    p.add_argument("--code-ds", default=os.getenv("CODE_DS", "codeparrot/codeparrot-clean"),
+                   help="HF dataset id for code (used when --mix-50-50); public & streamable")
     p.add_argument("--code-ds-config", default=os.getenv("CODE_DS_CONFIG"),
-                   help="HF dataset config for code (optional)")
-    p.add_argument("--code-licenses", default=os.getenv("CODE_LICENSES", "mit,apache,bsd,isc,cc0,mozilla"),
-                   help="Comma-separated allowlist for code licenses (substring match)")
+                   help="HF dataset config for code (optional, e.g., for code_search_net)")
+
+    # Default to no license filtering (CodeParrot datasets often lack license fields)
+    p.add_argument("--code-licenses", default=os.getenv("CODE_LICENSES", ""),
+                   help="Comma-separated allowlist for code licenses; leave empty for public sets like CodeParrot")
 
     args = p.parse_args()
 
     # also allow env var to toggle mixer
-    args.mix_50_50 = args.mix_50_50 or _env_flag("USE_TEXT_CODE_MIX", False)
+    args.mix_50_50 = args.mix_50_50 or (os.getenv("USE_TEXT_CODE_MIX", "").strip().lower() in {"1","true","yes","on"})
 
     # Enforce dataset only if NOT mixing
     if not args.mix_50_50 and not args.dataset:
