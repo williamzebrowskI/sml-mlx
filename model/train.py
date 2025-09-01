@@ -1,9 +1,9 @@
 # model/train.py
-# MLX distributed trainer (ring) with robust HF streaming, optional 50/50 mixer,
-# resume without dataset seeking, and GPU-watchdog-friendly chunked comms.
+# MLX distributed trainer with robust HF streaming, optional 50/50 mixer,
+# per-rank checkpoint loading (no in-place param broadcast), and chunked all-reduce.
 
 from __future__ import annotations
-import argparse, pathlib, math, json, time, itertools, socket, os, random, signal, platform
+import argparse, pathlib, math, json, time, itertools, socket, os, random, signal, platform, re
 from typing import Iterator, Dict, Any, Optional, Tuple
 from collections.abc import Mapping, Sequence
 
@@ -18,8 +18,8 @@ import sentencepiece as spm
 import numpy as np
 # import wandb
 
-# optional 50/50 mixer (present in your project)
 from .data_mixer import build_50_50_stream
+from .model import OpenELM, SMLMConfig
 
 # versions
 try:
@@ -36,8 +36,6 @@ try:
     from huggingface_hub import login as hf_login
 except Exception:
     hf_login = None
-
-from .model import OpenELM, SMLMConfig
 
 # ───────────────────────────────────
 # tiny logger
@@ -64,7 +62,6 @@ def _barrier() -> None:
 
 # ---------- GPU-watchdog-friendly chunked collectives ----------
 def _chunked_all_sum(arr: mx.array, *, max_elems: int) -> mx.array:
-    """All-reduce in chunks to avoid long single-kernel command buffers."""
     if not isinstance(arr, mx.array):
         return arr
     n = int(arr.size)
@@ -79,29 +76,18 @@ def _chunked_all_sum(arr: mx.array, *, max_elems: int) -> mx.array:
 def _tree_all_sum(tree, *, max_elems: int):
     return tree_map(lambda a: _chunked_all_sum(a, max_elems=max_elems) if isinstance(a, mx.array) else a, tree)
 
-def _broadcast_params_chunked(params, rank: int, *, max_elems: int) -> None:
-    # poor-man's broadcast: zero on non-root, then sum-reduce in chunks
-    def _broadcast_one(p: mx.array):
-        if rank != 0:
-            p[...] = 0
-        p[...] = _chunked_all_sum(p, max_elems=max_elems)
-        return p
-    tree_map(lambda x: _broadcast_one(x) if isinstance(x, mx.array) else x, params)
-
 # ───────────────────────────────────
 def encode_sp(example: Dict[str, Any], *, sp: spm.SentencePieceProcessor, key: str):
     ids = sp.encode(example[key], out_type=int, add_bos=True, add_eos=True)
     return {"ids": ids}
 
 def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
-    """Iterate a streaming HF dataset and handle transient 429/HTTP hiccups."""
     backoff = 2.0
     while True:
         it = iter(ds)
         try:
             for ex in it:
                 yield ex
-            # exhausted (rare for streaming) → restart loop
         except HfHubHTTPError as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code == 429:
@@ -123,7 +109,6 @@ def resilient_dataset_iter(ds, rank: int, *, backoff_max: float = 60.0):
             continue
 
 def sample_generator(dataset_iter: Iterator[Dict[str, Any]], ctx: int, bs: int) -> Iterator[mx.array]:
-    """Packs streaming tokenized examples into fixed windows of length ctx+1."""
     window, buf = ctx + 1, []
     while True:
         for ex in dataset_iter:
@@ -153,19 +138,20 @@ def _env_flag(name: str, default: bool = False) -> bool:
         return default
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
+# ───────────────────────────────────
 def get_args():
     p = argparse.ArgumentParser("OpenSML MLX trainer")
     p.add_argument("--config", required=True)
     p.add_argument("--tokenizer", required=True)
 
-    # Make --dataset optional; we require it only when not using the mixer
+    # Make --dataset optional; required only when not using the mixer
     p.add_argument("--dataset", required=False, help="HF dataset id (streaming)")
     p.add_argument("--dataset-config", default=None, help="HF dataset config name")
     p.add_argument("--train-split", default="train", help="split or slice, e.g. 'train', 'train[:1%]'")
 
     p.add_argument("--out", required=True)
     p.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
-    p.add_argument("--resume")
+    p.add_argument("--resume", help="Optional: path to a checkpoint file; step will be parsed from its name")
 
     # 50/50 mixer controls
     p.add_argument("--mix-50-50", action="store_true",
@@ -252,6 +238,24 @@ def print_effective_config(
     log(rank, "EFFECTIVE CONFIG →\n" + json.dumps(info, indent=2, sort_keys=True))
 
 # ───────────────────────────────────
+def _parse_step_from_name(path: str) -> int:
+    # accepts ".../ckpt_000123.safetensors" or ".../ckpt_000123_whatever.safetensors"
+    m = re.search(r"ckpt_(\d{1,12})", str(path))
+    return int(m.group(1)) if m else 0
+
+def _find_latest_ckpt(p: pathlib.Path) -> Tuple[Optional[pathlib.Path], int]:
+    cands = list(p.glob("ckpt_*.safetensors"))
+    if not cands:
+        return None, 0
+    def step_of(fp: pathlib.Path) -> int:
+        try:
+            return _parse_step_from_name(fp.name)
+        except Exception:
+            return 0
+    latest = max(cands, key=step_of)
+    return latest, step_of(latest)
+
+# ───────────────────────────────────
 def main():
     print(f"[BOOT] host={socket.gethostname()} rank_env={os.getenv('MLX_RANK')}")
     log(-1, "starting distributed init; MLX_HOSTS=", os.getenv("MLX_HOSTS"), "MLX_PORT=", os.getenv("MLX_PORT"))
@@ -262,7 +266,7 @@ def main():
     args = get_args()
     cfg = SMLMConfig.from_json(args.config)
 
-    # Optional: Hugging Face token to raise rate limits
+    # Optional HF token
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     if token and hf_login is not None:
         try:
@@ -285,6 +289,11 @@ def main():
     except Exception:
         default_dtype = "n/a"
 
+    # deterministic init option (fresh runs)
+    INIT_SEED = int(os.getenv("INIT_SEED", "0"))
+    if INIT_SEED:
+        mx.random.seed(INIT_SEED)
+
     log(rank, f"device={'gpu' if args.device=='gpu' else 'cpu'} default_dtype={default_dtype}")
     log(rank, f"use_fast_sdp={getattr(cfg, 'use_fast_sdp', True)}")
 
@@ -304,12 +313,10 @@ def main():
     ACCUM_STEPS = int(os.getenv("ACCUM_STEPS", cfg.accum_steps))
     SHUFFLE_BUF = int(os.getenv("SHUFFLE_BUFFER", 20000))
     BACKOFF_MAX = float(os.getenv("HF_BACKOFF_MAX", "60"))
-    STAGGER = float(os.getenv("RANK_STAGGER_SEC", str(rank * 2.0)))  # default: 2s * rank
+    STAGGER = float(os.getenv("RANK_STAGGER_SEC", str(rank * 2.0)))
+    ALLREDUCE_CHUNK_ELEMS = int(os.getenv("ALLREDUCE_CHUNK_ELEMS", "2000000"))
 
-    # watchdog-friendly comm chunking (in elements)
-    ALLREDUCE_CHUNK_ELEMS = int(os.getenv("ALLREDUCE_CHUNK_ELEMS", str(2_000_000)))
-
-    # Per-rank config dump (after overrides)
+    # Per-rank config dump
     print_effective_config(
         rank, size, cfg,
         host=platform.node(),
@@ -319,12 +326,7 @@ def main():
         ACCUM_STEPS=ACCUM_STEPS,
         SHUFFLE_BUF=SHUFFLE_BUF,
     )
-    if args.mix_50_50 and rank == 0:
-        log(rank, f"MIXED INPUT: text_ds={args.text_ds} code_ds={args.code_ds} "
-                  f"text_cfg={args.text_ds_config or 'None'} code_cfg={args.code_ds_config or 'None'} "
-                  f"code_licenses={args.code_licenses or 'none'}")
 
-    # quick sanity checks
     if cfg.model_dim != cfg.num_heads * cfg.head_dim:
         raise ValueError(f"model_dim ({cfg.model_dim}) != num_heads*head_dim ({cfg.num_heads*cfg.head_dim})")
     if cfg.context_size > cfg.rope_max_length:
@@ -332,35 +334,15 @@ def main():
 
     log(rank, f"LOCAL_BS={LOCAL_BS} ACCUM_STEPS={ACCUM_STEPS} SHUFFLE_BUFFER={SHUFFLE_BUF} context={cfg.context_size}")
     log(rank, f"rank-stagger={STAGGER:.1f}s, backoff_max={BACKOFF_MAX:.0f}s")
-
-    # Give each rank a small stagger to avoid synchronized bursts on the Hub
     if STAGGER > 0:
         time.sleep(STAGGER)
 
-    # ─────────────── streaming dataset (single) OR mixed text+code (50/50) ───────────────
-    download_config = DownloadConfig(max_retries=5)
-
-    # output dir & resume helpers (created early; used for offset logic below)
+    # ─────────────── prepare out paths and offset ───────────────
     out_dir = pathlib.Path(args.out); out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "meta.json"
     offset_file = out_dir / "offset.txt"
 
-    # helper: discover latest ckpt and parse step
-    def find_latest_ckpt(p: pathlib.Path) -> Tuple[Optional[pathlib.Path], int]:
-        cands = list(p.glob("ckpt_*.safetensors"))
-        if not cands:
-            return None, 0
-        def step_of(fp: pathlib.Path):
-            try:
-                stem = fp.stem
-                tail = stem.split("_")[-1]
-                return int(tail) if tail.isdigit() else 0
-            except Exception:
-                return 0
-        latest = max(cands, key=step_of)
-        return latest, step_of(latest)
-
-    # offset handling for restarts (data position)
+    # seek/offset
     if args.no_data_seek:
         offset = 0
         log(rank, "NO_DATA_SEEK active → not fast-forwarding the dataset stream.")
@@ -379,7 +361,9 @@ def main():
     rank_offset_tokens = offset // size
     skip_batches = 0 if args.no_data_seek else (rank_offset_tokens // tokens_per_rank_mb)
 
-    # Construct data iterator(s)
+    # ─────────────── build dataset iterator(s) ───────────────
+    download_config = DownloadConfig(max_retries=5)
+
     if args.mix_50_50:
         allow = {x.strip().lower() for x in (args.code_licenses or "").split(",") if x.strip()}
         log(rank, f"building 50/50 stream | text={args.text_ds} code={args.code_ds} licenses={sorted(list(allow)) or 'none'}")
@@ -431,35 +415,47 @@ def main():
     model = OpenELM(cfg)
     opt = optim.AdamW(cfg.max_lr, betas=(0.9, 0.98), eps=1e-8, weight_decay=cfg.weight_decay)
 
-    # ───── resume weights: load on rank 0 → broadcast to all (chunked)
-    start_step = 0
-    ckpt_path_to_load: Optional[str] = None
-    if args.resume:
-        ckpt_path_to_load = args.resume
+    # ───── resume: pick a step on rank0 → broadcast step → each rank loads ckpt_{step}
+    resume_step = 0
+    if rank == 0:
+        if args.resume:
+            resume_step = _parse_step_from_name(args.resume)
+            if resume_step == 0:
+                log(rank, f"could not parse step from --resume {args.resume}; ignoring")
+            else:
+                log(rank, f"--resume provided; using step {resume_step}")
+        if resume_step == 0:
+            ckpt, step = _find_latest_ckpt(out_dir)
+            if ckpt is not None and step > 0:
+                resume_step = step
+                log(rank, f"auto-resume: latest {ckpt.name} (step {step})")
+        # broadcast by all-sum (others add 0)
+        b = mx.array([resume_step], dtype=mx.int32)
     else:
-        if out_dir.exists() and rank == 0:
-            ckpt, ckpt_step = find_latest_ckpt(out_dir)
-            if ckpt is not None:
-                ckpt_path_to_load = str(ckpt)
-                start_step = ckpt_step
-                log(rank, f"auto-resume from {ckpt.name} (step {ckpt_step})")
+        b = mx.array([0], dtype=mx.int32)
 
-    if ckpt_path_to_load and rank == 0:
-        try:
-            model.load_weights(ckpt_path_to_load)
-            if start_step == 0 and meta_path.exists():
-                # prefer meta only if filename didn't give us a step
-                start_step = int(json.loads(meta_path.read_text()).get("global_step", 0))
-            mx.eval(model.parameters())
-        except Exception as e:
-            log(rank, f"resume load failed: {e!r}")
-            start_step = 0
-            ckpt_path_to_load = None
-
+    resume_step = int(mx.distributed.all_sum(b)[0])
     _barrier()
-    ALLREDUCE_CHUNK_ELEMS = int(os.getenv("ALLREDUCE_CHUNK_ELEMS", str(2_000_000)))
-    _broadcast_params_chunked(model.parameters(), rank, max_elems=ALLREDUCE_CHUNK_ELEMS)
-    log(rank, f"weights synced – entering compile (start_step={start_step})")
+
+    start_step = int(resume_step)
+    if resume_step > 0:
+        # preferred local ckpt path (requires the file to exist on each host)
+        local_ckpt = out_dir / f"ckpt_{resume_step:06d}.safetensors"
+        load_path = None
+        if local_ckpt.exists():
+            load_path = str(local_ckpt)
+        elif args.resume and pathlib.Path(args.resume).exists():
+            load_path = args.resume  # fallback to exact path if available here
+        if load_path is None:
+            raise FileNotFoundError(
+                f"Resume step {resume_step} chosen, but neither {local_ckpt} nor {args.resume or '(none)'} exists on this host. "
+                f"Copy ckpt_{resume_step:06d}.safetensors to {out_dir} on every Mac."
+            )
+        log(rank, f"loading weights from {load_path}")
+        model.load_weights(load_path)
+        mx.eval(model.parameters())
+
+    log(rank, f"weights ready – entering compile (start_step={start_step})")
 
     # numerically-stable loss (logits upcast to fp32)
     def loss_fn(m, batch):
@@ -488,11 +484,7 @@ def main():
     log(rank, "compile done; starting training loop")
 
     # if rank == 0:
-    #     wandb.init(
-    #         project="fineweb-pretrain",
-    #         config={**cfg.__dict__, "LOCAL_BS": LOCAL_BS, "ACCUM_STEPS": ACCUM_STEPS, "world_size": size},
-    #         name=f"pretrain-{start_step:06d}",
-    #     )
+    #     wandb.init(...)
 
     def compute_grad_norm(tree) -> float:
         flats = [g for g in _flatten(tree) if isinstance(g, mx.array)]
@@ -501,12 +493,12 @@ def main():
     acc_l = acc_s = 0
     accum_grads = None
     micro_step = 0
-    RESTART_WARM = 10_000  # short warm restart
+    RESTART_WARM = 10_000
     toks_per_update = size * LOCAL_BS * (cfg.context_size + 1) * ACCUM_STEPS
     last_log_t = time.time()
     log(rank, f"effective tokens/update ≈ {toks_per_update:,}")
 
-    # graceful shutdown: capture SIGINT/SIGTERM and save
+    # graceful shutdown
     stop_flag = {"stop": False}
     def _handle(sig, _frame):
         stop_flag["stop"] = True
@@ -552,7 +544,7 @@ def main():
             batch = next(train_it)
             loss, grads = value_and_grad(model, batch); mx.eval(loss, grads)
 
-            # detect/skip NaN loss to keep accumulation clean
+            # detect/skip NaN loss
             if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
                 if rank == 0:
                     x, y = batch[:, :-1], batch[:, 1:]
@@ -568,7 +560,7 @@ def main():
             micro_step += 1
 
             if micro_step == ACCUM_STEPS:
-                # all-reduce grads (chunked to avoid GPU watchdog)
+                # all-reduce grads (chunked)
                 global_grads = _tree_all_sum(accum_grads, max_elems=ALLREDUCE_CHUNK_ELEMS)
                 grad_norm = compute_grad_norm(global_grads)
                 # clean & clip
@@ -582,7 +574,7 @@ def main():
                 accum_grads = None; micro_step = 0
 
                 acc_l += float(loss); acc_s += 1
-                last_completed_step = global_step  # for safe resume
+                last_completed_step = global_step
 
                 # logging & checkpoints
                 if rank == 0:
@@ -601,19 +593,16 @@ def main():
                             f"updates/s={updates_per_sec:.2f} tokens/s≈{tokens_per_sec:,.0f}",
                             flush=True
                         )
-                        # wandb.log({...}, step=int(global_step))
                         acc_l = acc_s = 0
 
                     if global_step % 5000 == 0:
                         save_state(global_step, tag=None)
 
-                # stop requested → autosave and exit cleanly
                 if stop_flag["stop"]:
                     save_state(last_completed_step, tag="autosave")
                     break
 
     finally:
-        # Always flush meta/offset; also write a lightweight autosave ckpt
         save_state(last_completed_step, tag="finalize")
         if rank == 0:
             log(rank, "✅ State flushed on exit")
