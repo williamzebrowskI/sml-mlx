@@ -28,12 +28,12 @@ except Exception:
 
 # ────────────────────────────── RUNS ────────────────────────────────
 # (prompt, temperature, top_k, top_p)
-RUNS: List[Tuple[str, float, int, float]] = [
-    ("Once upon a time in a faraway land, there lived a young princess who…", 0.1, 50, 0.7),
-    ("The capital of France is ",                                            0.0, 0, 1.0),
-    ("Explain quantum computing to me: ",                                    0.2, 50, 0.9),
-    ("A recipe for blueberry muffins: ",                                     0.1, 30, 0.8),
-    ("# file: merge.py\ndef merge_sorted(a, b):\n    \"\"\"Merge two sorted lists.\"\"\"\n", 0.0, 0, 1.0),
+RUNS = [
+    ("Headline: Breakthrough Battery Doubles EV Range\n\nArticle: ",          0.7, 50, 0.9),
+    ("Paris is the capital and most populous city of France. It ",            0.7, 50, 0.9),
+    ("In computer science, a binary search tree is ",                          0.7, 50, 0.9),
+    ("The recipe begins by preheating the oven to 375°F. First, ",             0.7, 40, 0.9),
+    ("Once upon a time in a faraway land, there lived a young princess who ",  0.7, 40, 0.9),
 ]
 
 # ─────────────────────────── small utils ────────────────────────────
