@@ -99,9 +99,17 @@ def sample_next_id(
     repetition_penalty: float,
     generated: List[int],
 ) -> int:
-    t = max(1e-5, float(temperature))
-    x = (logits.astype(mx.float32) / t)
+    # apply penalties first in raw logit space
+    x = logits.astype(mx.float32)
     x = apply_repetition_penalty(x, generated, repetition_penalty)
+
+    # true greedy when temp <= 0
+    if temperature <= 0.0:
+        return int(mx.argmax(x))
+
+    # otherwise sample
+    t = max(1e-5, float(temperature))
+    x = x / t
     x = filter_top_k(x, top_k)
     x = filter_top_p(x, top_p)
     probs = nn.softmax(x, axis=-1)
