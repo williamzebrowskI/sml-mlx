@@ -28,12 +28,23 @@ except Exception:
 
 # ────────────────────────────── RUNS ────────────────────────────────
 # (prompt, temperature, top_k, top_p)
+# (prompt, temperature, top_k, top_p)
 RUNS = [
-    ("Headline: Breakthrough Battery Doubles EV Range\n\nArticle: ",          0.7, 50, 0.9),
-    ("Paris is the capital and most populous city of France. It ",            0.7, 50, 0.9),
-    ("In computer science, a binary search tree is ",                          0.7, 50, 0.9),
-    ("The recipe begins by preheating the oven to 375°F. First, ",             0.7, 40, 0.9),
-    ("Once upon a time in a faraway land, there lived a young princess who ",  0.7, 40, 0.9),
+    ("Headline: Breakthrough Battery Doubles EV Range\n\nArticle: ",                         0.8,  80, 0.95),
+    ("Paris is the capital and most populous city of France. It ",                           0.0,   0, 1.00),  # greedy
+    ("In computer science, a binary search tree is ",                                        0.2,   0, 0.90),  # nucleus only
+    ("Write a short news report about a local science fair: ",                               0.7,  50, 0.90),
+    ("A recipe for blueberry muffins: ",                                                     0.3,  30, 0.85),
+    ("Once upon a time in a faraway land, there lived a young princess who ",                0.9, 100, 0.95),
+    ("Explain quantum computing to a 10-year-old: ",                                         0.4,  40, 0.90),
+    ("List five tips for better sleep: ",                                                    0.2,  20, 0.80),
+    ("Describe a calm beach at sunset: ",                                                    0.8,  60, 0.90),
+    ("Write a brief bio for a software engineer named Maya: ",                               0.6,  50, 0.90),
+    ("Summarize the causes of the French Revolution in 3–4 sentences: ",                     0.3,   0, 0.92),
+    ("Draft a friendly reminder email about a team meeting next Tuesday at 10am: ",          0.5,  40, 0.85),
+    ("Explain photosynthesis in one paragraph: ",                                            0.2,   0, 0.92),
+    ("Continue the story: 'The door creaked open, and I knew this time was different.' ",    0.7,  50, 0.90),
+    ("Write a motivational quote followed by a one-sentence reflection: ",                   0.6,  30, 0.90),
 ]
 
 # ─────────────────────────── small utils ────────────────────────────
