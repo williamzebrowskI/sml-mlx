@@ -6,7 +6,7 @@
 import math, time, json, gzip, io, random, threading, queue, requests
 from dataclasses import dataclass
 from typing import List, Optional, Iterator, Tuple
-from utils import hf_text_iterator, hf_qa_iterator
+from .utils import hf_text_iterator, hf_qa_iterator
 
 import mlx.core as mx
 import mlx.nn as nn
