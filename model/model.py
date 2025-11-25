@@ -463,10 +463,10 @@ def main():
       python -m model.model --dataset Skylion007/openwebtext --expected-world 4
     """
     parser = argparse.ArgumentParser(description="Distributed MLX 50M-parameter LM training on HF streaming data")
-    parser.add_argument("--dataset", type=str, default="bigcode/the-stack-dedup", help="Hugging Face dataset name")
-    parser.add_argument("--dataset-config", type=str, default="python", help="Dataset config name (e.g. 'python')")
+    parser.add_argument("--dataset", type=str, default="Skylion007/openwebtext", help="Hugging Face dataset name")
+    parser.add_argument("--dataset-config", type=str, default=None, help="Dataset config name (e.g. 'plain_text' for OpenWebText)")
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
-    parser.add_argument("--text-field", type=str, default="content", help="Field containing raw text/code")
+    parser.add_argument("--text-field", type=str, default="text", help="Field containing raw text/code")
     parser.add_argument("--trust-remote-code", action="store_true", default=True, help="Allow HF dataset code execution")
     parser.add_argument("--no-trust-remote-code", action="store_false", dest="trust_remote_code", help="Disable HF dataset code execution")
 
