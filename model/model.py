@@ -1,5 +1,5 @@
 # tinygp_train_mlx.py
-# A ~50M-parameter LM in MLX with Hugging Face streaming + ring-distributed training across multiple Macs.
+# A ~25M-parameter LM in MLX with Hugging Face streaming + ring-distributed training across multiple Macs.
 
 import math, time, json, gzip, io, os, random, threading, queue, requests, argparse
 from dataclasses import dataclass
@@ -121,15 +121,15 @@ class TransformerBlock(nn.Module):
 @dataclass
 class TinyGPConfig:
     vocab_size: int
-    d_model: int = 384      # was 512  → fewer hidden units
-    n_heads: int = 6        # was 8    → keeps d_model % n_heads == 0
-    n_layers: int = 8       # was 12   → fewer transformer blocks
-    max_seq: int = 512      # keep as-is for now (you can drop to 256 if needed)
+    d_model: int = 384      # hidden size
+    n_heads: int = 6        # attention heads (384 % 6 == 0)
+    n_layers: int = 12      # transformer blocks
+    max_seq: int = 512      # reduce to 256 if you need more memory headroom
     label_smoothing: float = 0.0
 
 class TinyGPLM(nn.Module):
     """
-    Causal LM with tied output head (configured to ~50M params for training below).
+    Causal LM with tied output head (~25M params with the defaults below).
     """
     def __init__(self, cfg: TinyGPConfig):
         super().__init__()
@@ -332,7 +332,7 @@ def train_hf_distributed_50m(
     cfg = TinyGPConfig(
         vocab_size=VOCAB,
         d_model=384,
-        n_layers=8,
+        n_layers=12,
         n_heads=6,
         max_seq=seq_len,
     )
