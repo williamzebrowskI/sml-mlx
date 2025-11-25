@@ -289,7 +289,7 @@ def train_hf_distributed_50m(
     lr: float = 3e-4,
     wd: float = 0.1,
     backend: str = "ring",
-    expected_world: int = 4,
+    expected_world: int | None = None,
     log_every: int = 50,
     save_dir: str = "model/checkpoints_50m",
     save_every: int = 5_000,
@@ -450,7 +450,7 @@ def main():
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
 
     parser.add_argument("--backend", type=str, default="ring", help="MLX distributed backend")
-    parser.add_argument("--expected-world", type=int, default=4, help="Expected number of ranks (Macs)")
+    parser.add_argument("--expected-world", type=int, default=None, help="If set, assert world size equals this value")
 
     parser.add_argument("--log-every", type=int, default=50, help="Logging interval (steps)")
     parser.add_argument("--save-dir", type=str, default="model/checkpoints_50m", help="Checkpoint directory (rank 0 only)")
