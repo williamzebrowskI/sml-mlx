@@ -1,9 +1,7 @@
 # tinygp_train_mlx.py
-# A ~9M-parameter action-aware LM in MLX + streamed remote data + ring-distributed training.
-# Author: You :)
-# Python 3.11+, pip install mlx requests
+# A ~50M-parameter LM in MLX with Hugging Face streaming + ring-distributed training across multiple Macs.
 
-import math, time, json, gzip, io, random, threading, queue, requests
+import math, time, json, gzip, io, os, random, threading, queue, requests, argparse
 from dataclasses import dataclass
 from typing import List, Optional, Iterator, Tuple
 from .utils import hf_text_iterator, hf_qa_iterator
@@ -62,7 +60,7 @@ def sinusoidal_positions(T: int, D: int) -> mx.array:
     return pe  # (T, D)
 
 # ---------------------------
-# Tiny Transformer (~9M)
+# Transformer backbone (~50M when configured below)
 # ---------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -123,15 +121,15 @@ class TransformerBlock(nn.Module):
 @dataclass
 class TinyGPConfig:
     vocab_size: int
-    d_model: int = 256
+    d_model: int = 512
     n_heads: int = 8
-    n_layers: int = 6
-    max_seq: int = 512
+    n_layers: int = 16
+    max_seq: int = 1024
     label_smoothing: float = 0.0
 
 class TinyGPLM(nn.Module):
     """
-    ~9M param causal LM with tied output head and optional 'ponder' refinement.
+    Causal LM with tied output head (configured to ~50M params for training below).
     """
     def __init__(self, cfg: TinyGPConfig):
         super().__init__()
@@ -233,15 +231,43 @@ class PrefetchBatches:
 # Distributed helpers
 # ---------------------------
 
-def init_dist(backend="ring"):
+def init_dist(backend: str = "ring", expected_world: int | None = None):
+    """
+    Initialize MLX distributed group and verify that all hosts are present.
+
+    When expected_world is not None, we assert that the discovered world size
+    matches (e.g., 4 Macs in your Thunderbolt ring).
+    """
     try:
         group = mx.distributed.init(backend=backend)
-    except Exception:
-        group = mx.distributed.init(backend="any")
-    world = getattr(group, "size", 1)
-    rank = getattr(group, "rank", 0)
-    if world is None: world = int(mx.distributed.all_sum(mx.array(1)).item())
-    if rank is None:  rank = 0
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize MLX distributed backend '{backend}': {e}")
+
+    # MLX may expose size/rank as methods; handle both attrs and callables.
+    world_attr = getattr(group, "size", None)
+    rank_attr = getattr(group, "rank", None)
+
+    if callable(world_attr):
+        world = int(world_attr())
+    else:
+        world = int(world_attr) if world_attr is not None else None
+
+    if callable(rank_attr):
+        rank = int(rank_attr())
+    else:
+        rank = int(rank_attr) if rank_attr is not None else None
+
+    if world is None:
+        world = int(mx.distributed.all_sum(mx.array(1)).item())
+    if rank is None:
+        rank = 0
+
+    if expected_world is not None and world != expected_world:
+        raise RuntimeError(f"Expected world size {expected_world}, but got {world}")
+
+    if rank == 0:
+        print(f"[dist] backend={backend} world={world} (expected={expected_world})")
+
     return group, world, rank
 
 def allreduce_grads(grads, world):
@@ -249,88 +275,119 @@ def allreduce_grads(grads, world):
     return nn.utils.tree_map(lambda g: mx.distributed.all_sum(g) / world, grads)
 
 # ---------------------------
-# Training
+# Training on Hugging Face streaming (distributed)
 # ---------------------------
 
-def train(
-    urls: list[str] | None = None,             # old path (RemoteJSONLStream)
-    hf_text: dict | None = None,               # new: {"name":..., "config":..., "split":..., "field":...}
-    hf_qa: dict | None = None,                 # new: {"name":..., "config":..., "split":..., "q_field":..., "a_field":...}
-    max_steps: int = 50_000,
+def train_hf_distributed_50m(
+    dataset_name: str,
+    dataset_config: str | None = None,
+    split: str = "train",
+    text_field: str = "text",
+    max_steps: int = 100_000,
     seq_len: int = 512,
     batch_size: int = 8,
     lr: float = 3e-4,
     wd: float = 0.1,
     backend: str = "ring",
+    expected_world: int = 4,
     log_every: int = 50,
-    ckpt_path: str = "tgp10m.safetensors",
+    save_dir: str = "model/checkpoints_50m",
+    save_every: int = 5_000,
 ):
-    group, world, rank = init_dist(backend)
+    """
+    Train a ~50M-parameter byte-level LM with MLX using Hugging Face's
+    streaming datasets API, distributed across multiple Macs via a ring backend.
 
-    cfg = TinyGPConfig(vocab_size=VOCAB, d_model=256, n_layers=6, n_heads=8, max_seq=seq_len)
+    Each rank receives a disjoint stream shard via hf_text_iterator(..., world_size, rank)
+    and gradients are all-reduced across hosts.
+    """
+    _, world, rank = init_dist(backend=backend, expected_world=expected_world)
+
+    cfg = TinyGPConfig(
+        vocab_size=VOCAB,
+        d_model=512,
+        n_layers=16,
+        n_heads=8,
+        max_seq=seq_len,
+    )
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
+
     opt = optim.AdamW(lr, weight_decay=wd)
     get_val_and_grad = nn.value_and_grad(model, lambda m, x, y: m(x, y)["loss"])
 
-    # ---- choose a stream ----
-    if hf_text:
-        sample_iter = hf_text_iterator(
-            world_size=world, rank=rank, **hf_text
-        )
-    elif hf_qa:
-        sample_iter = hf_qa_iterator(
-            world_size=world, rank=rank, **hf_qa
-        )
-    elif urls:
-        sample_iter = RemoteJSONLStream(urls)
-    else:
-        raise ValueError("Provide either hf_text, hf_qa, or urls for streaming.")
+    sample_iter = hf_text_iterator(
+        name=dataset_name,
+        config=dataset_config,
+        split=split,
+        field=text_field,
+        world_size=world,
+        rank=rank,
+    )
 
-    batcher = PrefetchBatches(iter(sample_iter), batch_tokens=seq_len)
-
-    # ---- batching & training stay the same ----
-    def make_batch(iterator, bs):
-        X = mx.zeros((bs, seq_len), dtype=mx.int32)
-        Y = mx.zeros((bs, seq_len), dtype=mx.int32)
+    def batch_iterator():
+        X = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+        Y = mx.zeros((batch_size, seq_len), dtype=mx.int32)
         filled = 0
-        for obj in iterator:
-            text = obj.get("trace") or obj.get("text")
+        for ex in sample_iter:
+            # hf_text_iterator always yields {"text": "..."} regardless of the dataset field name
+            text = ex.get("text")
             if not text:
                 continue
-            ids = TOK.encode(text)[:seq_len]
+
+            ids = TOK.encode(text)
             if len(ids) < 2:
                 continue
-            x = ids[:-1]; y = ids[1:]
-            x += [PAD] * (seq_len - len(x))
-            y += [PAD] * (seq_len - len(y))
-            X[filled] = mx.array(x, dtype=mx.int32)
-            Y[filled] = mx.array(y, dtype=mx.int32)
+
+            # next-token prediction: x is all but last, y is all but first
+            ids = ids[: seq_len + 1]
+            x_ids = ids[:-1]
+            y_ids = ids[1:]
+
+            if len(x_ids) < seq_len:
+                pad_len = seq_len - len(x_ids)
+                x_ids = x_ids + [PAD] * pad_len
+                y_ids = y_ids + [PAD] * pad_len
+
+            X[filled] = mx.array(x_ids, dtype=mx.int32)
+            Y[filled] = mx.array(y_ids, dtype=mx.int32)
             filled += 1
-            if filled == bs:
+
+            if filled == batch_size:
                 yield X, Y
-                X = mx.zeros((bs, seq_len), dtype=mx.int32)
-                Y = mx.zeros((bs, seq_len), dtype=mx.int32)
+                X = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+                Y = mx.zeros((batch_size, seq_len), dtype=mx.int32)
                 filled = 0
 
+    os.makedirs(save_dir, exist_ok=True)
+
     step, t0 = 0, time.time()
-    for X, Y in make_batch(batcher, batch_size):
+    for X, Y in batch_iterator():
         loss, grads = get_val_and_grad(model, X, Y)
         grads = allreduce_grads(grads, world)
         opt.update(model, grads)
         mx.eval(model.parameters(), opt.state)
 
-        if step % log_every == 0 and rank == 0:
-            tok_s = (batch_size * seq_len) / max(1e-9, (time.time() - t0))
-            print(f"[{step}] loss={loss.item():.4f} toks/s={tok_s:.0f}")
+        if rank == 0 and step % log_every == 0:
+            toks = batch_size * seq_len * world
+            tok_s = toks / max(1e-9, (time.time() - t0))
+            print(f"[{step}] loss={loss.item():.4f} global_toks/s={tok_s:.0f}")
             t0 = time.time()
+
         step += 1
+
+        if rank == 0 and step > 0 and step % save_every == 0:
+            ckpt_path = os.path.join(save_dir, f"ckpt_{step:06d}.safetensors")
+            mx.save_safetensors(ckpt_path, model.parameters())
+            print(f"[{step}] Saved checkpoint {ckpt_path}")
+
         if step >= max_steps:
             break
 
     if rank == 0:
-        mx.save_safetensors(ckpt_path, model.parameters())
-        print("Saved", ckpt_path)
+        final_path = os.path.join(save_dir, "ckpt_final.safetensors")
+        mx.save_safetensors(final_path, model.parameters())
+        print(f"Saved final checkpoint {final_path}")
 
 # ---------------------------
 # Tiny agent runner (inference)
@@ -373,3 +430,55 @@ def answer_with_tools(model: TinyGPLM, question: str, search_fn, fetch_snippet_f
         # fallback: extend plan
         context += "\n" + out
     return "I could not answer."
+
+
+def main():
+    """
+    CLI entrypoint:
+      python -m model.model --dataset Skylion007/openwebtext --expected-world 4
+    """
+    parser = argparse.ArgumentParser(description="Distributed MLX 50M-parameter LM training on HF streaming data")
+    parser.add_argument("--dataset", type=str, default="Skylion007/openwebtext", help="Hugging Face dataset name")
+    parser.add_argument("--dataset-config", type=str, default=None, help="Dataset config name (e.g. 'en')")
+    parser.add_argument("--split", type=str, default="train", help="Dataset split")
+    parser.add_argument("--text-field", type=str, default="text", help="Field containing raw text")
+
+    parser.add_argument("--max-steps", type=int, default=100_000, help="Total optimization steps")
+    parser.add_argument("--seq-len", type=int, default=512, help="Context length")
+    parser.add_argument("--batch-size", type=int, default=8, help="Per-rank batch size")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
+
+    parser.add_argument("--backend", type=str, default="ring", help="MLX distributed backend")
+    parser.add_argument("--expected-world", type=int, default=4, help="Expected number of ranks (Macs)")
+
+    parser.add_argument("--log-every", type=int, default=50, help="Logging interval (steps)")
+    parser.add_argument("--save-dir", type=str, default="model/checkpoints_50m", help="Checkpoint directory (rank 0 only)")
+    parser.add_argument("--save-every", type=int, default=5_000, help="Checkpoint interval (steps, rank 0 only)")
+
+    args = parser.parse_args()
+
+    dataset_config = None
+    if args.dataset_config not in (None, "", "None", "none"):
+        dataset_config = args.dataset_config
+
+    train_hf_distributed_50m(
+        dataset_name=args.dataset,
+        dataset_config=dataset_config,
+        split=args.split,
+        text_field=args.text_field,
+        max_steps=args.max_steps,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        wd=args.wd,
+        backend=args.backend,
+        expected_world=args.expected_world,
+        log_every=args.log_every,
+        save_dir=args.save_dir,
+        save_every=args.save_every,
+    )
+
+
+if __name__ == "__main__":
+    main()
