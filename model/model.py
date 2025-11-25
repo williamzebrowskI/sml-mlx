@@ -1,44 +1,52 @@
 # model/model.py
-# A ~25–50M parameter LM in MLX with HF streaming + ring DDP,
-# using your SentencePiece tokenizer (fineweb-trained).
+# A ~25M-parameter LM in MLX with HF streaming + ring DDP,
+# using a simple byte-level tokenizer (no external SPM files).
 
 import os
-# Keep Metal queues short to avoid watchdogs
 os.environ.setdefault("MX_MAX_INFLIGHT_CMDS", "1")
 
 import math, time, json, gzip, requests, argparse
 from dataclasses import dataclass
 from typing import List, Optional, Iterator, Tuple
 
-import sentencepiece as spm
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.nn.losses as losses
 import mlx.optimizers as optim
 
 # ---------------------------
-# SentencePiece tokenizer
+# Byte-level tokenizer + specials
 # ---------------------------
 
-class SPMTokenizer:
-    def __init__(self, model_path: str):
-        self.sp = spm.SentencePieceProcessor(model_file=model_path)
-        self.vocab_size = int(self.sp.vocab_size())
-        # These return -1 if the id is not defined in the SPM model
-        self.pad_id = int(self.sp.pad_id()) if hasattr(self.sp, "pad_id") else -1
-        self.bos_id = int(self.sp.bos_id())
-        self.eos_id = int(self.sp.eos_id())
+SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>"]
+PAD_ID, BOS_ID, EOS_ID = 0, 1, 2
+
+class ByteTokenizer:
+    def __init__(self):
+        self.special = {tok: i for i, tok in enumerate(SPECIAL_TOKENS)}
+        self.offset = len(SPECIAL_TOKENS)
+        self.vocab_size = self.offset + 256  # byte tokens
 
     def encode(self, s: str) -> List[int]:
-        add_bos = self.bos_id >= 0
-        add_eos = self.eos_id >= 0
-        return self.sp.encode(s, out_type=int, add_bos=add_bos, add_eos=add_eos)
+        ids = [self.special["<BOS>"]]
+        ids += [self.offset + b for b in s.encode("utf-8")]
+        ids += [self.special["<EOS>"]]
+        return ids
 
     def decode(self, ids: List[int]) -> str:
-        return self.sp.decode(ids)
+        bytes_out: List[int] = []
+        for t in ids:
+            if t < self.offset:
+                continue
+            b = t - self.offset
+            if 0 <= b < 256:
+                bytes_out.append(b)
+        return bytes(bytes_out).decode("utf-8", errors="ignore")
 
-# default path (override via --spm-model)
-DEFAULT_SPM_PATH = "tokenizer/fineweb_spm/spm.model"
+TOK = ByteTokenizer()
+VOCAB_SIZE = TOK.vocab_size
+PAD_ID = PAD_ID
+mask_id_for_loss = PAD_ID
 
 # ---------------------------
 # Sinusoidal positions (param-free)
@@ -192,13 +200,7 @@ def clip_global(tree, max_norm):
 # Training
 # ---------------------------
 
-# globals bound at runtime after tokenizer is loaded
-TOK: Optional[SPMTokenizer] = None
-PAD_ID: int = -1
-mask_id_for_loss: int = -1  # PAD_ID or fallback
-
 def train_hf_distributed(
-    spm_model_path: str,
     dataset_name: str,
     dataset_config: str | None = None,
     split: str = "train",
@@ -220,15 +222,9 @@ def train_hf_distributed(
     eval_prompt: str = "Hello, world. ",
     eval_tokens: int = 50,
 ):
-    global TOK, PAD_ID, mask_id_for_loss
-    TOK = SPMTokenizer(spm_model_path)
-    VOCAB = TOK.vocab_size
-    PAD_ID = TOK.pad_id if TOK.pad_id >= 0 else (TOK.eos_id if TOK.eos_id >= 0 else 0)
-    mask_id_for_loss = PAD_ID
-
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
 
-    cfg = TinyGPConfig(vocab_size=VOCAB, d_model=384, n_heads=6, n_layers=12,
+    cfg = TinyGPConfig(vocab_size=VOCAB_SIZE, d_model=384, n_heads=6, n_layers=12,
                        max_seq=seq_len, max_grad_norm=1.0)
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
@@ -346,9 +342,8 @@ def train_hf_distributed(
 # ---------------------------
 
 def generate(model: TinyGPLM, prompt: str, max_new_tokens=128):
-    # use EOS for stop if available
     ids = TOK.encode(prompt)[: model.cfg.max_seq]
-    stop_id = TOK.eos_id if TOK.eos_id >= 0 else None
+    stop_id = EOS_ID
     x = mx.array([ids], dtype=mx.int32)
     for _ in range(max_new_tokens):
         logits = model.logits(x)[:, -1, :]            # (1,V)
@@ -364,8 +359,7 @@ def generate(model: TinyGPLM, prompt: str, max_new_tokens=128):
 # ---------------------------
 
 def main():
-    p = argparse.ArgumentParser("Distributed MLX LM training (SPM tokenizer)")
-    p.add_argument("--spm-model", type=str, default=DEFAULT_SPM_PATH)
+    p = argparse.ArgumentParser("Distributed MLX LM training (byte-level tokenizer)")
     p.add_argument("--dataset", type=str, default="Skylion007/openwebtext")
     p.add_argument("--dataset-config", type=str, default="plain_text")
     p.add_argument("--split", type=str, default="train")
@@ -393,7 +387,6 @@ def main():
 
     cfg = None if args.dataset_config in (None,"","None","none") else args.dataset_config
     train_hf_distributed(
-        spm_model_path=args.spm_model,
         dataset_name=args.dataset,
         dataset_config=cfg,
         split=args.split,
