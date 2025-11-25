@@ -123,8 +123,8 @@ class TinyGPConfig:
     vocab_size: int
     d_model: int = 512
     n_heads: int = 8
-    n_layers: int = 16
-    max_seq: int = 1024
+    n_layers: int = 12
+    max_seq: int = 512
     label_smoothing: float = 0.0
 
 class TinyGPLM(nn.Module):
