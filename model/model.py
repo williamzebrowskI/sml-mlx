@@ -171,6 +171,7 @@ def init_dist(backend="ring", expected_world=None):
     group = mx.distributed.init(backend=backend)
     size = group.size() if callable(getattr(group,"size",None)) else int(getattr(group,"size",1))
     rank = group.rank() if callable(getattr(group,"rank",None)) else int(getattr(group,"rank",0))
+    print(f"[boot] rank={rank} size={size} backend={backend}", flush=True)
     if expected_world is not None and size != expected_world:
         raise RuntimeError(f"Expected world size {expected_world}, got {size}")
     if rank == 0:
@@ -223,14 +224,17 @@ def train_hf_distributed(
     eval_tokens: int = 50,
 ):
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
+    print(f"[rank {rank}] entering train_hf_distributed", flush=True)
 
     cfg = TinyGPConfig(vocab_size=VOCAB_SIZE, d_model=384, n_heads=6, n_layers=12,
                        max_seq=seq_len, max_grad_norm=1.0)
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
+    print(f"[rank {rank}] model initialized (vocab={VOCAB_SIZE}, d_model={cfg.d_model}, layers={cfg.n_layers})", flush=True)
 
     # sync weights across ranks
     if world > 1:
+        print(f"[rank {rank}] syncing initial weights across ranks", flush=True)
         synced = nn.utils.tree_map(lambda p: (mx.distributed.all_sum(p) / world) if isinstance(p, mx.array) else p,
                                    model.parameters())
         model.update(synced); mx.eval(model.parameters())
@@ -238,7 +242,9 @@ def train_hf_distributed(
     opt = optim.AdamW(lr, weight_decay=wd)
     get_vg = nn.value_and_grad(model, lambda m, x, y: m(x, y)["loss"])
 
+    print(f"[rank {rank}] creating HF iterator: dataset={dataset_name} config={dataset_config} split={split}", flush=True)
     sample_iter = hf_text_iterator(dataset_name, dataset_config, split, text_field, world, rank, trust_remote_code)
+    print(f"[rank {rank}] HF iterator ready, starting batch loop", flush=True)
 
     # Batcher with SPM, padding with PAD_ID (or EOS fallback) and masking in loss
     def batch_iterator():
@@ -273,6 +279,8 @@ def train_hf_distributed(
     last = time.time()
 
     for X, Y in batch_iterator():
+        if update_step == 0 and micro_accum == 0:
+            print(f"[rank {rank}] first batch received, shapes X={X.shape} Y={Y.shape}", flush=True)
         loss, grads = get_vg(model, X, Y)
         mx.eval(loss, grads)
 
@@ -300,6 +308,8 @@ def train_hf_distributed(
             clipped, gnorm = clip_global(global_grads, model.cfg.max_grad_norm)
             opt.update(model, clipped)
             mx.eval(model.parameters(), opt.state)
+            if update_step == 0:
+                print(f"[rank {rank}] first optimizer step applied", flush=True)
 
             now = time.time()
             dt = now - last; last = now
