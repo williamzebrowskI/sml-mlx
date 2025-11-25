@@ -308,6 +308,7 @@ def train_hf_distributed_50m(
     max_steps: int = 100_000,
     seq_len: int = 512,
     batch_size: int = 8,
+    accum_steps: int = 1,
     lr: float = 3e-4,
     wd: float = 0.1,
     backend: str = "ring",
@@ -325,7 +326,8 @@ def train_hf_distributed_50m(
     streaming datasets API, distributed across multiple Macs via a ring backend.
 
     Each rank receives a disjoint stream shard via hf_text_iterator(..., world_size, rank)
-    and gradients are all-reduced across hosts.
+    and gradients are all-reduced across hosts. Supports local gradient accumulation
+    (accum_steps) before the all-reduce to reduce per-step overhead on smaller GPUs.
     """
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
 
@@ -338,6 +340,11 @@ def train_hf_distributed_50m(
     )
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
+
+    # Ensure all ranks start from the same weights
+    if world > 1:
+        synced = nn.utils.tree_map(lambda p: mx.distributed.all_sum(p) / world if isinstance(p, mx.array) else p, model.parameters())
+        model.update(synced)
 
     opt = optim.AdamW(lr, weight_decay=wd)
     get_val_and_grad = nn.value_and_grad(model, lambda m, x, y: m(x, y)["loss"])
@@ -388,50 +395,60 @@ def train_hf_distributed_50m(
 
     os.makedirs(save_dir, exist_ok=True)
 
-    step, t0 = 0, time.time()
-    last_step_time = time.time()
+    update_step = 0
+    t0 = time.time()
+    last_update_time = time.time()
+    micro_accum = 0
+    accum_grads = None
     for X, Y in batch_iterator():
         loss, grads = get_val_and_grad(model, X, Y)
-        grads = allreduce_grads(grads, world)
-        opt.update(model, grads)
-        mx.eval(model.parameters(), opt.state)
+        # scale for accumulation
+        grads = nn.utils.tree_map(lambda g: g / accum_steps if isinstance(g, mx.array) else g, grads)
+        accum_grads = grads if accum_grads is None else nn.utils.tree_map(
+            lambda a, g: a + g if isinstance(a, mx.array) else a, accum_grads, grads
+        )
+        micro_accum += 1
 
-        now = time.time()
-        step_time = now - last_step_time
-        last_step_time = now
+        if micro_accum == accum_steps:
+            global_grads = allreduce_grads(accum_grads, world)
+            opt.update(model, global_grads)
+            mx.eval(model.parameters(), opt.state)
 
-        if step % log_every == 0:
-            # local tokens/sec per rank
-            local_tok_s = (batch_size * seq_len) / max(1e-9, step_time)
-            ppl = math.exp(loss.item()) if loss.item() < 20 else float("inf")
-            if per_rank_logs:
-                print(f"[{step}] rank={rank} loss={loss.item():.4f} ppl={ppl:.2f} local_toks/s={local_tok_s:.0f}")
-            if rank == 0:
-                # approximate global toks/sec over interval
-                interval_tok_s = (batch_size * seq_len * world) / max(1e-9, (now - t0))
-                print(f"[{step}] loss={loss.item():.4f} ppl={ppl:.2f} global_toks/s={interval_tok_s:.0f}")
-                t0 = now
+            now = time.time()
+            step_time = now - last_update_time
+            last_update_time = now
 
-        # periodic eval on rank 0
-        if rank == 0 and eval_every and step % eval_every == 0:
-            try:
-                sample = generate(model, eval_prompt, max_new_tokens=eval_tokens)
-                print(f"[{step}] sample:\n{sample}\n---")
-            except Exception as e:
-                print(f"[{step}] eval sample failed: {e}")
+            if update_step % log_every == 0:
+                local_tok_s = (batch_size * seq_len * accum_steps) / max(1e-9, step_time)
+                ppl = math.exp(loss.item()) if loss.item() < 20 else float("inf")
+                if per_rank_logs:
+                    print(f"[{update_step}] rank={rank} loss={loss.item():.4f} ppl={ppl:.2f} local_toks/s={local_tok_s:.0f}")
+                if rank == 0:
+                    interval_tok_s = (batch_size * seq_len * accum_steps * world) / max(1e-9, (now - t0))
+                    print(f"[{update_step}] loss={loss.item():.4f} ppl={ppl:.2f} global_toks/s={interval_tok_s:.0f}")
+                    t0 = now
 
-        step += 1
+            if rank == 0 and eval_every and update_step % eval_every == 0:
+                try:
+                    sample = generate(model, eval_prompt, max_new_tokens=eval_tokens)
+                    print(f"[{update_step}] sample:\n{sample}\n---")
+                except Exception as e:
+                    print(f"[{update_step}] eval sample failed: {e}")
 
-        if rank == 0 and step > 0 and step % save_every == 0:
-            ckpt_path = os.path.join(save_dir, f"ckpt_{step:06d}.safetensors")
-            saved_path, err = _save_checkpoint(model.parameters(), ckpt_path)
-            if err:
-                print(f"[{step}] safetensors save failed ({err}); wrote fallback {saved_path}")
-            else:
-                print(f"[{step}] Saved checkpoint {saved_path}")
+            update_step += 1
+            micro_accum = 0
+            accum_grads = None
 
-        if step >= max_steps:
-            break
+            if rank == 0 and update_step > 0 and update_step % save_every == 0:
+                ckpt_path = os.path.join(save_dir, f"ckpt_{update_step:06d}.safetensors")
+                saved_path, err = _save_checkpoint(model.parameters(), ckpt_path)
+                if err:
+                    print(f"[{update_step}] safetensors save failed ({err}); wrote fallback {saved_path}")
+                else:
+                    print(f"[{update_step}] Saved checkpoint {saved_path}")
+
+            if update_step >= max_steps:
+                break
 
     if rank == 0:
         final_path = os.path.join(save_dir, "ckpt_final.safetensors")
@@ -500,6 +517,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=100_000, help="Total optimization steps")
     parser.add_argument("--seq-len", type=int, default=512, help="Context length")
     parser.add_argument("--batch-size", type=int, default=8, help="Per-rank batch size")
+    parser.add_argument("--accum-steps", type=int, default=1, help="Gradient accumulation steps before all-reduce/update")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
 
@@ -529,6 +547,7 @@ def main():
         max_steps=args.max_steps,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
+        accum_steps=args.accum_steps,
         lr=args.lr,
         wd=args.wd,
         backend=args.backend,
