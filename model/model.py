@@ -283,6 +283,7 @@ def train_hf_distributed_50m(
     dataset_config: str | None = None,
     split: str = "train",
     text_field: str = "text",
+    trust_remote_code: bool = False,
     max_steps: int = 100_000,
     seq_len: int = 512,
     batch_size: int = 8,
@@ -293,6 +294,9 @@ def train_hf_distributed_50m(
     log_every: int = 50,
     save_dir: str = "model/checkpoints_50m",
     save_every: int = 5_000,
+    eval_every: int = 2_000,
+    eval_prompt: str = "def fib(n):",
+    eval_tokens: int = 64,
 ):
     """
     Train a ~50M-parameter byte-level LM with MLX using Hugging Face's
@@ -323,6 +327,7 @@ def train_hf_distributed_50m(
         field=text_field,
         world_size=world,
         rank=rank,
+        trust_remote_code=trust_remote_code,
     )
 
     def batch_iterator():
@@ -373,6 +378,14 @@ def train_hf_distributed_50m(
             tok_s = toks / max(1e-9, (time.time() - t0))
             print(f"[{step}] loss={loss.item():.4f} global_toks/s={tok_s:.0f}")
             t0 = time.time()
+
+        # periodic eval on rank 0
+        if rank == 0 and eval_every and step % eval_every == 0:
+            try:
+                sample = generate(model, eval_prompt, max_new_tokens=eval_tokens)
+                print(f"[{step}] sample:\n{sample}\n---")
+            except Exception as e:
+                print(f"[{step}] eval sample failed: {e}")
 
         step += 1
 
@@ -438,10 +451,12 @@ def main():
       python -m model.model --dataset Skylion007/openwebtext --expected-world 4
     """
     parser = argparse.ArgumentParser(description="Distributed MLX 50M-parameter LM training on HF streaming data")
-    parser.add_argument("--dataset", type=str, default="Skylion007/openwebtext", help="Hugging Face dataset name")
-    parser.add_argument("--dataset-config", type=str, default=None, help="Dataset config name (e.g. 'en')")
+    parser.add_argument("--dataset", type=str, default="bigcode/the-stack-dedup", help="Hugging Face dataset name")
+    parser.add_argument("--dataset-config", type=str, default="python", help="Dataset config name (e.g. 'python')")
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
-    parser.add_argument("--text-field", type=str, default="text", help="Field containing raw text")
+    parser.add_argument("--text-field", type=str, default="content", help="Field containing raw text/code")
+    parser.add_argument("--trust-remote-code", action="store_true", default=True, help="Allow HF dataset code execution")
+    parser.add_argument("--no-trust-remote-code", action="store_false", dest="trust_remote_code", help="Disable HF dataset code execution")
 
     parser.add_argument("--max-steps", type=int, default=100_000, help="Total optimization steps")
     parser.add_argument("--seq-len", type=int, default=512, help="Context length")
@@ -455,6 +470,9 @@ def main():
     parser.add_argument("--log-every", type=int, default=50, help="Logging interval (steps)")
     parser.add_argument("--save-dir", type=str, default="model/checkpoints_50m", help="Checkpoint directory (rank 0 only)")
     parser.add_argument("--save-every", type=int, default=5_000, help="Checkpoint interval (steps, rank 0 only)")
+    parser.add_argument("--eval-every", type=int, default=2_000, help="Sampling interval (steps, rank 0 only)")
+    parser.add_argument("--eval-prompt", type=str, default="def fib(n):", help="Prompt used for periodic sampling")
+    parser.add_argument("--eval-tokens", type=int, default=64, help="Number of tokens to sample at eval")
 
     args = parser.parse_args()
 
@@ -467,6 +485,7 @@ def main():
         dataset_config=dataset_config,
         split=args.split,
         text_field=args.text_field,
+        trust_remote_code=args.trust_remote_code,
         max_steps=args.max_steps,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
@@ -477,6 +496,9 @@ def main():
         log_every=args.log_every,
         save_dir=args.save_dir,
         save_every=args.save_every,
+        eval_every=args.eval_every,
+        eval_prompt=args.eval_prompt,
+        eval_tokens=args.eval_tokens,
     )
 
 

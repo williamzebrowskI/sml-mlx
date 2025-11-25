@@ -10,6 +10,7 @@ def hf_text_iterator(
     rank: int = 0,
     shuffle_buffer: int = 10_000,
     seed: int = 42,
+    trust_remote_code: bool = False,
 ):
     """
     Streams lines from a Hugging Face dataset WITHOUT downloading the whole set.
@@ -19,7 +20,13 @@ def hf_text_iterator(
       name="c4", config="en", split="train", field="text"
       name="wikimedia/wikipedia", config="20231101.en", split="train", field="text"
     """
-    ds = load_dataset(name, config, split=split, streaming=True)
+    ds = load_dataset(
+        name,
+        config,
+        split=split,
+        streaming=True,
+        trust_remote_code=trust_remote_code,
+    )
     # Ensure each machine sees a disjoint portion of the stream
     if world_size > 1:
         ds = ds.shard(num_shards=world_size, index=rank)
@@ -41,13 +48,20 @@ def hf_qa_iterator(
     rank: int = 0,
     shuffle_buffer: int = 2048,
     seed: int = 123,
+    trust_remote_code: bool = False,
 ):
     """
     Streams QA examples for Phase B (tool-augmented supervision).
     Yields {'trace': '<QUESTION>...</QUESTION> ... <ANSWER>...'} minimal traces.
     You can later expand this to inject <SEARCH>/<DOC> steps.
     """
-    ds = load_dataset(name, config, split=split, streaming=True)
+    ds = load_dataset(
+        name,
+        config,
+        split=split,
+        streaming=True,
+        trust_remote_code=trust_remote_code,
+    )
     if world_size > 1:
         ds = ds.shard(num_shards=world_size, index=rank)
     ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
