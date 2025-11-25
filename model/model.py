@@ -1,86 +1,96 @@
-# tinygp_train_mlx.py
+# model/model.py
+# A ~25–50M parameter LM in MLX with HF streaming + ring DDP,
+# using your SentencePiece tokenizer (fineweb-trained).
+
 import os
-# ↓ set before importing mlx to limit Metal queue depth
+# Keep Metal queues short to avoid watchdogs
 os.environ.setdefault("MX_MAX_INFLIGHT_CMDS", "1")
 
-import math, time, json, gzip, requests, argparse, queue, threading
+import math, time, json, gzip, requests, argparse
 from dataclasses import dataclass
 from typing import List, Optional, Iterator, Tuple
 
+import sentencepiece as spm
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.nn.losses as losses
 import mlx.optimizers as optim
 
-# ------------------ special tokens + toy byte tokenizer ------------------
-SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>",
-                  "<QUESTION>", "</QUESTION>", "<PLAN>", "</PLAN>",
-                  "<SEARCH>", "</SEARCH>", "<DOC>", "</DOC>",
-                  "<QUOTE>", "</QUOTE>", "<CALC>", "</CALC>", "<ANSWER>", "</ANSWER>"]
-PAD, BOS, EOS = 0, 1, 2
+# ---------------------------
+# SentencePiece tokenizer
+# ---------------------------
 
-class ByteTokenizer:
-    def __init__(self):
-        self.special = {tok:i for i,tok in enumerate(SPECIAL_TOKENS)}
-        self.offset = len(SPECIAL_TOKENS)
-        self.vocab_size = self.offset + 256
+class SPMTokenizer:
+    def __init__(self, model_path: str):
+        self.sp = spm.SentencePieceProcessor(model_file=model_path)
+        self.vocab_size = int(self.sp.vocab_size())
+        # These return -1 if the id is not defined in the SPM model
+        self.pad_id = int(self.sp.pad_id()) if hasattr(self.sp, "pad_id") else -1
+        self.bos_id = int(self.sp.bos_id())
+        self.eos_id = int(self.sp.eos_id())
+
     def encode(self, s: str) -> List[int]:
-        return [BOS] + [self.offset + b for b in s.encode("utf-8")] + [EOS]
+        add_bos = self.bos_id >= 0
+        add_eos = self.eos_id >= 0
+        return self.sp.encode(s, out_type=int, add_bos=add_bos, add_eos=add_eos)
+
     def decode(self, ids: List[int]) -> str:
-        out = []
-        for t in ids:
-            if t < self.offset: continue
-            b = t - self.offset
-            if 0 <= b < 256:
-                out.append(b)
-        return bytes(out).decode("utf-8", errors="ignore")
+        return self.sp.decode(ids)
 
-TOK = ByteTokenizer()
-VOCAB = TOK.vocab_size
+# default path (override via --spm-model)
+DEFAULT_SPM_PATH = "tokenizer/fineweb_spm/spm.model"
 
-# ------------------ sinusoidal positions ------------------
+# ---------------------------
+# Sinusoidal positions (param-free)
+# ---------------------------
+
 def sinusoidal_positions(T: int, D: int) -> mx.array:
     pos = mx.arange(T, dtype=mx.float32)[:, None]
-    i = mx.arange(D, dtype=mx.float32)[None, :]
+    i   = mx.arange(D, dtype=mx.float32)[None, :]
     angle = pos / (10000 ** (2 * (i // 2) / D))
     return mx.where((i % 2) == 0, mx.sin(angle), mx.cos(angle))  # (T, D)
 
-# ------------------ transformer (fast SDPA + cached mask) ------------------
+# ---------------------------
+# Transformer (fast SDPA + cached additive mask)
+# ---------------------------
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, max_seq: int):
         super().__init__()
         assert d_model % n_heads == 0
-        self.h = n_heads
+        self.h  = n_heads
         self.dh = d_model // n_heads
         self.qkv  = nn.Linear(d_model, 3 * d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model,    bias=False)
         self.max_seq = max_seq
-        self._mask = nn.MultiHeadAttention.create_additive_causal_mask(max_seq)  # (T,T) additive
+        # cached additive causal mask (T,T) → broadcastable
+        self._mask = nn.MultiHeadAttention.create_additive_causal_mask(max_seq)
 
     def __call__(self, x: mx.array) -> mx.array:
         B, T, D = x.shape
-        qkv = self.qkv(x)
-        q, k, v = mx.split(qkv, 3, axis=-1)  # (B,T,D)
+        qkv = self.qkv(x)                              # (B,T,3D)
+        q, k, v = mx.split(qkv, 3, axis=-1)           # (B,T,D) each
 
         def split_heads(t):
-            t = t.reshape(B, T, self.h, self.dh)  # (B,T,H,dh)
-            return t.transpose(0, 2, 1, 3)        # (B,H,T,dh)
+            t = t.reshape(B, T, self.h, self.dh)      # (B,T,H,dh)
+            return t.transpose(0, 2, 1, 3)            # (B,H,T,dh)
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
-        mask = self._mask[:T, :T]                # (T,T) additive
+
+        mask = self._mask[:T, :T]                     # (T,T) additive
         attn = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=1.0 / math.sqrt(self.dh), mask=mask
-        )                                         # (B,H,T,dh)
-        ctx = attn.transpose(0,2,1,3).reshape(B, T, D)
+        )                                             # (B,H,T,dh)
+        ctx = attn.transpose(0, 2, 1, 3).reshape(B, T, D)
         return self.proj(ctx)
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, max_seq: int, mlp_mult=4):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
+        self.ln1  = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, max_seq)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
+        self.ln2  = nn.LayerNorm(d_model)
+        self.ffn  = nn.Sequential(
             nn.Linear(d_model, mlp_mult * d_model, bias=False),
             nn.GELU(),
             nn.Linear(mlp_mult * d_model, d_model, bias=False),
@@ -100,6 +110,9 @@ class TinyGPConfig:
     max_grad_norm: float = 1.0
 
 class TinyGPLM(nn.Module):
+    """
+    Causal LM with tied output head (~25–50M params depending on vocab/dim).
+    """
     def __init__(self, cfg: TinyGPConfig):
         super().__init__()
         self.cfg = cfg
@@ -113,33 +126,39 @@ class TinyGPLM(nn.Module):
 
     def logits(self, x_ids: mx.array) -> mx.array:
         B, T = x_ids.shape
-        x = self.tok_emb(x_ids) + self.pos_cache[:T,:][None,:,:]
+        x = self.tok_emb(x_ids) + self.pos_cache[:T, :][None, :, :]
         x = self.blocks(x)
-        x = self.ln_f(x)
-        W = self.tok_emb.weight   # (V,D)
-        return mx.matmul(x, W.transpose(1,0)) + self.out_bias  # (B,T,V)
+        x = self.ln_f(x)                               # (B,T,D)
+        W = self.tok_emb.weight                        # (V,D)
+        return mx.matmul(x, W.transpose(1, 0)) + self.out_bias  # (B,T,V)
 
     def __call__(self, x_ids: mx.array, targets: Optional[mx.array] = None):
         lg = self.logits(x_ids)
         if targets is None:
             return {"logits": lg}
-        ce = losses.cross_entropy(lg, targets, reduction="none")  # (B,T)
-        mask = (targets != PAD).astype(mx.float32)
+        ce = losses.cross_entropy(lg, targets, reduction="none")   # (B,T)
+        # Mask PADs (or EOS fallback set in batcher)
+        mask = (targets != mask_id_for_loss).astype(mx.float32)
         loss = (ce * mask).sum() / (mask.sum() + 1e-6)
         return {"logits": lg, "loss": loss}
 
-# ------------------ HF streaming helpers ------------------
+# ---------------------------
+# HF streaming helpers
+# ---------------------------
+
 def hf_text_iterator(name, config, split, field, world_size, rank, trust_remote_code=False):
     from datasets import load_dataset
     ds = load_dataset(name, config, split=split, streaming=True, trust_remote_code=trust_remote_code)
-    # round-robin sharding
     i = 0
     for ex in ds:
         if i % world_size == rank:
             yield {"text": ex.get(field, "")}
         i += 1
 
-# ------------------ Distributed helpers ------------------
+# ---------------------------
+# Distributed + utils
+# ---------------------------
+
 def init_dist(backend="ring", expected_world=None):
     group = mx.distributed.init(backend=backend)
     size = group.size() if callable(getattr(group,"size",None)) else int(getattr(group,"size",1))
@@ -169,8 +188,17 @@ def clip_global(tree, max_norm):
     scale = max_norm / (total + 1e-6)
     return nn.utils.tree_map(lambda x: x * scale if isinstance(x, mx.array) else x, tree), total
 
-# ------------------ Training loop ------------------
-def train_hf_distributed_50m(
+# ---------------------------
+# Training
+# ---------------------------
+
+# globals bound at runtime after tokenizer is loaded
+TOK: Optional[SPMTokenizer] = None
+PAD_ID: int = -1
+mask_id_for_loss: int = -1  # PAD_ID or fallback
+
+def train_hf_distributed(
+    spm_model_path: str,
     dataset_name: str,
     dataset_config: str | None = None,
     split: str = "train",
@@ -186,12 +214,18 @@ def train_hf_distributed_50m(
     expected_world: int | None = None,
     log_every: int = 10,
     per_rank_logs: bool = False,
-    save_dir: str = "model/checkpoints_50m",
+    save_dir: str = "model/checkpoints_spm",
     save_every: int = 5_000,
-    eval_every: int = 0,                    # disable eval by default (shorten kernels)
+    eval_every: int = 0,
     eval_prompt: str = "Hello, world. ",
     eval_tokens: int = 50,
 ):
+    global TOK, PAD_ID, mask_id_for_loss
+    TOK = SPMTokenizer(spm_model_path)
+    VOCAB = TOK.vocab_size
+    PAD_ID = TOK.pad_id if TOK.pad_id >= 0 else (TOK.eos_id if TOK.eos_id >= 0 else 0)
+    mask_id_for_loss = PAD_ID
+
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
 
     cfg = TinyGPConfig(vocab_size=VOCAB, d_model=384, n_heads=6, n_layers=12,
@@ -199,7 +233,7 @@ def train_hf_distributed_50m(
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
 
-    # sync weights
+    # sync weights across ranks
     if world > 1:
         synced = nn.utils.tree_map(lambda p: (mx.distributed.all_sum(p) / world) if isinstance(p, mx.array) else p,
                                    model.parameters())
@@ -210,6 +244,7 @@ def train_hf_distributed_50m(
 
     sample_iter = hf_text_iterator(dataset_name, dataset_config, split, text_field, world, rank, trust_remote_code)
 
+    # Batcher with SPM, padding with PAD_ID (or EOS fallback) and masking in loss
     def batch_iterator():
         X = mx.zeros((batch_size, seq_len), dtype=mx.int32)
         Y = mx.zeros((batch_size, seq_len), dtype=mx.int32)
@@ -223,8 +258,8 @@ def train_hf_distributed_50m(
             x_ids, y_ids = ids[:-1], ids[1:]
             if len(x_ids) < seq_len:
                 pad = seq_len - len(x_ids)
-                x_ids = x_ids + [PAD] * pad
-                y_ids = y_ids + [PAD] * pad
+                x_ids = x_ids + [PAD_ID] * pad
+                y_ids = y_ids + [PAD_ID] * pad
             X[filled] = mx.array(x_ids, dtype=mx.int32)
             Y[filled] = mx.array(y_ids, dtype=mx.int32)
             filled += 1
@@ -271,23 +306,22 @@ def train_hf_distributed_50m(
             mx.eval(model.parameters(), opt.state)
 
             now = time.time()
-            dt = now - last
-            last = now
+            dt = now - last; last = now
             if update_step % log_every == 0:
-                tok_s_local = (batch_size * seq_len * accum_steps) / max(1e-9, dt)
+                toks_local_s = (batch_size * seq_len * accum_steps) / max(1e-9, dt)
                 ppl = math.exp(min(20.0, float(loss.item())))
                 if per_rank_logs:
-                    print(f"[{update_step}] rank={rank} loss={loss.item():.4f} ppl={ppl:.2f} grad_norm={gnorm:.3f} tok/s={tok_s_local:.0f}")
+                    print(f"[{update_step}] rank={rank} loss={loss.item():.4f} ppl={ppl:.2f} grad_norm={gnorm:.3f} tok/s={toks_local_s:.0f}")
                 if rank == 0 and not per_rank_logs:
-                    print(f"[{update_step}] loss={loss.item():.4f} ppl={ppl:.2f} grad_norm={gnorm:.3f} tok/s≈{tok_s_local*world:.0f}")
+                    print(f"[{update_step}] loss={loss.item():.4f} ppl={ppl:.2f} grad_norm={gnorm:.3f} tok/s≈{toks_local_s*world:.0f}")
 
             if rank == 0 and eval_every and update_step % eval_every == 0:
                 try:
-                    print(f"[{update_step}] sample:\n{generate(model, 'Hello, world. ', 64)}\n---")
+                    print(f"[{update_step}] sample:\n{generate(model, eval_prompt, 64)}\n---")
                 except Exception as e:
                     print(f"[{update_step}] eval failed: {e}")
 
-            if rank == 0 and update_step > 0 and update_step % 5000 == 0:
+            if rank == 0 and update_step > 0 and update_step % save_every == 0:
                 path = os.path.join(save_dir, f"ckpt_{update_step:06d}.safetensors")
                 try:
                     mx.save_safetensors(path, model.parameters()); print(f"[{update_step}] saved {path}")
@@ -295,32 +329,43 @@ def train_hf_distributed_50m(
                     alt = path + ".npz"; mx.save(alt, model.parameters()); print(f"[{update_step}] safetensors failed ({e}); wrote {alt}")
 
             update_step += 1
-            accum_grads = None; micro_accum = 0
+            micro_accum = 0
+            accum_grads = None
             if update_step >= max_steps:
                 break
 
     if rank == 0:
-        path = os.path.join(save_dir, "ckpt_final.safetensors")
+        final_path = os.path.join(save_dir, "ckpt_final.safetensors")
         try:
-            mx.save_safetensors(path, model.parameters()); print(f"[final] saved {path}")
+            mx.save_safetensors(final_path, model.parameters()); print(f"[final] saved {final_path}")
         except Exception as e:
-            alt = path + ".npz"; mx.save(alt, model.parameters()); print(f"[final] safetensors failed ({e}); wrote {alt}")
+            alt = final_path + ".npz"; mx.save(alt, model.parameters()); print(f"[final] safetensors failed ({e}); wrote {alt}")
 
-# ------------------ simple greedy generator ------------------
+# ---------------------------
+# Simple greedy generator
+# ---------------------------
+
 def generate(model: TinyGPLM, prompt: str, max_new_tokens=128):
+    # use EOS for stop if available
     ids = TOK.encode(prompt)[: model.cfg.max_seq]
+    stop_id = TOK.eos_id if TOK.eos_id >= 0 else None
     x = mx.array([ids], dtype=mx.int32)
     for _ in range(max_new_tokens):
-        logits = model.logits(x)[:, -1, :]
+        logits = model.logits(x)[:, -1, :]            # (1,V)
         next_id = int(mx.argmax(logits, axis=-1).item())
         ids.append(next_id)
-        if next_id == EOS: break
+        if stop_id is not None and next_id == stop_id:
+            break
         x = mx.array([ids[-model.cfg.max_seq:]], dtype=mx.int32)
     return TOK.decode(ids)
 
-# ------------------ CLI ------------------
+# ---------------------------
+# CLI
+# ---------------------------
+
 def main():
-    p = argparse.ArgumentParser("Distributed MLX ~25–50M LM training on HF streaming")
+    p = argparse.ArgumentParser("Distributed MLX LM training (SPM tokenizer)")
+    p.add_argument("--spm-model", type=str, default=DEFAULT_SPM_PATH)
     p.add_argument("--dataset", type=str, default="Skylion007/openwebtext")
     p.add_argument("--dataset-config", type=str, default="plain_text")
     p.add_argument("--split", type=str, default="train")
@@ -339,7 +384,7 @@ def main():
 
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--per-rank-logs", action="store_true")
-    p.add_argument("--save-dir", type=str, default="model/checkpoints_50m")
+    p.add_argument("--save-dir", type=str, default="model/checkpoints_spm")
     p.add_argument("--save-every", type=int, default=5000)
     p.add_argument("--eval-every", type=int, default=0)
     p.add_argument("--eval-prompt", type=str, default="Hello, world. ")
@@ -347,7 +392,8 @@ def main():
     args = p.parse_args()
 
     cfg = None if args.dataset_config in (None,"","None","none") else args.dataset_config
-    train_hf_distributed_50m(
+    train_hf_distributed(
+        spm_model_path=args.spm_model,
         dataset_name=args.dataset,
         dataset_config=cfg,
         split=args.split,
