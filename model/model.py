@@ -121,10 +121,10 @@ class TransformerBlock(nn.Module):
 @dataclass
 class TinyGPConfig:
     vocab_size: int
-    d_model: int = 512
-    n_heads: int = 8
-    n_layers: int = 12
-    max_seq: int = 512
+    d_model: int = 384      # was 512  → fewer hidden units
+    n_heads: int = 6        # was 8    → keeps d_model % n_heads == 0
+    n_layers: int = 8       # was 12   → fewer transformer blocks
+    max_seq: int = 512      # keep as-is for now (you can drop to 256 if needed)
     label_smoothing: float = 0.0
 
 class TinyGPLM(nn.Module):
@@ -331,9 +331,9 @@ def train_hf_distributed_50m(
 
     cfg = TinyGPConfig(
         vocab_size=VOCAB,
-        d_model=512,
-        n_layers=16,
-        n_heads=8,
+        d_model=384,
+        n_layers=8,
+        n_heads=6,
         max_seq=seq_len,
     )
     model = TinyGPLM(cfg)
