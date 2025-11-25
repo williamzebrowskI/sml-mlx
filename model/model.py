@@ -138,8 +138,8 @@ class TinyGPLM(nn.Module):
         self.blocks = nn.Sequential(*[TransformerBlock(cfg.d_model, cfg.n_heads) for _ in range(cfg.n_layers)])
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.out_bias = mx.zeros((cfg.vocab_size,))  # tie output to tok_emb weight.T + bias
-        # no learned pos emb to keep params <10M
-        self.register_buffer("pos_cache", sinusoidal_positions(cfg.max_seq, cfg.d_model))
+        # cache sinusoidal positions (non-trainable)
+        self.pos_cache = sinusoidal_positions(cfg.max_seq, cfg.d_model)
 
     def logits(self, x_ids: mx.array) -> mx.array:
         # x_ids: (B, T)
