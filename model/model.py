@@ -320,9 +320,10 @@ def train_hf_distributed(
             if rank == 0 and update_step > 0 and update_step % save_every == 0:
                 path = os.path.join(save_dir, f"ckpt_{update_step:06d}.safetensors")
                 try:
-                    mx.save_safetensors(path, model.parameters()); print(f"[{update_step}] saved {path}")
+                    mx.save_safetensors(path, model.parameters())
+                    print(f"[{update_step}] saved {path}")
                 except Exception as e:
-                    alt = path + ".npz"; mx.save(alt, model.parameters()); print(f"[{update_step}] safetensors failed ({e}); wrote {alt}")
+                    print(f"[{update_step}] safetensors save failed ({e}); checkpoint NOT written")
 
             update_step += 1
             micro_accum = 0
@@ -333,9 +334,10 @@ def train_hf_distributed(
     if rank == 0:
         final_path = os.path.join(save_dir, "ckpt_final.safetensors")
         try:
-            mx.save_safetensors(final_path, model.parameters()); print(f"[final] saved {final_path}")
+            mx.save_safetensors(final_path, model.parameters())
+            print(f"[final] saved {final_path}")
         except Exception as e:
-            alt = final_path + ".npz"; mx.save(alt, model.parameters()); print(f"[final] safetensors failed ({e}); wrote {alt}")
+            print(f"[final] safetensors save failed ({e}); final checkpoint NOT written")
 
 # ---------------------------
 # Simple greedy generator
