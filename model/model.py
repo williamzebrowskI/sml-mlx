@@ -278,6 +278,20 @@ def allreduce_grads(grads, world):
 # Training on Hugging Face streaming (distributed)
 # ---------------------------
 
+
+def _save_checkpoint(params, path: str):
+    """
+    Attempt to save in safetensors format; fall back to mx.save if unsupported.
+    """
+    try:
+        mx.save_safetensors(path, params)
+        return path, None
+    except Exception as e:
+        alt_path = path + ".npz"
+        mx.save(alt_path, params)
+        return alt_path, e
+
+
 def train_hf_distributed_50m(
     dataset_name: str,
     dataset_config: str | None = None,
@@ -403,16 +417,22 @@ def train_hf_distributed_50m(
 
         if rank == 0 and step > 0 and step % save_every == 0:
             ckpt_path = os.path.join(save_dir, f"ckpt_{step:06d}.safetensors")
-            mx.save_safetensors(ckpt_path, model.parameters())
-            print(f"[{step}] Saved checkpoint {ckpt_path}")
+            saved_path, err = _save_checkpoint(model.parameters(), ckpt_path)
+            if err:
+                print(f"[{step}] safetensors save failed ({err}); wrote fallback {saved_path}")
+            else:
+                print(f"[{step}] Saved checkpoint {saved_path}")
 
         if step >= max_steps:
             break
 
     if rank == 0:
         final_path = os.path.join(save_dir, "ckpt_final.safetensors")
-        mx.save_safetensors(final_path, model.parameters())
-        print(f"Saved final checkpoint {final_path}")
+        saved_path, err = _save_checkpoint(model.parameters(), final_path)
+        if err:
+            print(f"[final] safetensors save failed ({err}); wrote fallback {saved_path}")
+        else:
+            print(f"Saved final checkpoint {saved_path}")
 
 # ---------------------------
 # Tiny agent runner (inference)
