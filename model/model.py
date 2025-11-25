@@ -402,6 +402,8 @@ def train_hf_distributed_50m(
     accum_grads = None
     for X, Y in batch_iterator():
         loss, grads = get_val_and_grad(model, X, Y)
+        # materialize to avoid building huge lazy graphs over many micro-steps
+        mx.eval(loss, grads)
         # scale for accumulation
         grads = nn.utils.tree_map(lambda g: g / accum_steps if isinstance(g, mx.array) else g, grads)
         accum_grads = grads if accum_grads is None else nn.utils.tree_map(
