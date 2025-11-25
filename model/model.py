@@ -291,7 +291,8 @@ def train_hf_distributed_50m(
     wd: float = 0.1,
     backend: str = "ring",
     expected_world: int | None = None,
-    log_every: int = 50,
+    log_every: int = 10,
+    per_rank_logs: bool = False,
     save_dir: str = "model/checkpoints_50m",
     save_every: int = 5_000,
     eval_every: int = 2_000,
@@ -367,17 +368,28 @@ def train_hf_distributed_50m(
     os.makedirs(save_dir, exist_ok=True)
 
     step, t0 = 0, time.time()
+    last_step_time = time.time()
     for X, Y in batch_iterator():
         loss, grads = get_val_and_grad(model, X, Y)
         grads = allreduce_grads(grads, world)
         opt.update(model, grads)
         mx.eval(model.parameters(), opt.state)
 
-        if rank == 0 and step % log_every == 0:
-            toks = batch_size * seq_len * world
-            tok_s = toks / max(1e-9, (time.time() - t0))
-            print(f"[{step}] loss={loss.item():.4f} global_toks/s={tok_s:.0f}")
-            t0 = time.time()
+        now = time.time()
+        step_time = now - last_step_time
+        last_step_time = now
+
+        if step % log_every == 0:
+            # local tokens/sec per rank
+            local_tok_s = (batch_size * seq_len) / max(1e-9, step_time)
+            ppl = math.exp(loss.item()) if loss.item() < 20 else float("inf")
+            if per_rank_logs:
+                print(f"[{step}] rank={rank} loss={loss.item():.4f} ppl={ppl:.2f} local_toks/s={local_tok_s:.0f}")
+            if rank == 0:
+                # approximate global toks/sec over interval
+                interval_tok_s = (batch_size * seq_len * world) / max(1e-9, (now - t0))
+                print(f"[{step}] loss={loss.item():.4f} ppl={ppl:.2f} global_toks/s={interval_tok_s:.0f}")
+                t0 = now
 
         # periodic eval on rank 0
         if rank == 0 and eval_every and step % eval_every == 0:
@@ -467,7 +479,8 @@ def main():
     parser.add_argument("--backend", type=str, default="ring", help="MLX distributed backend")
     parser.add_argument("--expected-world", type=int, default=None, help="If set, assert world size equals this value")
 
-    parser.add_argument("--log-every", type=int, default=50, help="Logging interval (steps)")
+    parser.add_argument("--log-every", type=int, default=10, help="Logging interval (steps)")
+    parser.add_argument("--per-rank-logs", action="store_true", help="Print per-rank loss/tok/s each log interval")
     parser.add_argument("--save-dir", type=str, default="model/checkpoints_50m", help="Checkpoint directory (rank 0 only)")
     parser.add_argument("--save-every", type=int, default=5_000, help="Checkpoint interval (steps, rank 0 only)")
     parser.add_argument("--eval-every", type=int, default=2_000, help="Sampling interval (steps, rank 0 only)")
@@ -494,6 +507,7 @@ def main():
         backend=args.backend,
         expected_world=args.expected_world,
         log_every=args.log_every,
+        per_rank_logs=args.per_rank_logs,
         save_dir=args.save_dir,
         save_every=args.save_every,
         eval_every=args.eval_every,
