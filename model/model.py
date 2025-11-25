@@ -272,7 +272,14 @@ def init_dist(backend: str = "ring", expected_world: int | None = None):
 
 def allreduce_grads(grads, world):
     if world == 1: return grads
-    return nn.utils.tree_map(lambda g: mx.distributed.all_sum(g) / world, grads)
+    def _reduce(g):
+        try:
+            # Prefer CPU stream to avoid blocking Metal command buffers on GPU
+            return mx.distributed.all_sum(g, stream=mx.cpu) / world
+        except TypeError:
+            # Fallback for older MLX without stream arg
+            return mx.distributed.all_sum(g) / world
+    return nn.utils.tree_map(_reduce, grads)
 
 # ---------------------------
 # Training on Hugging Face streaming (distributed)
