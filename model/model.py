@@ -23,6 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.nn.losses as losses
 import mlx.optimizers as optim
+from mlx.utils import tree_map
 
 # ---------------------------
 # SentencePiece tokenizer (BPE) wrapper
@@ -231,7 +232,7 @@ def allreduce_grads(grads, world):
             except TypeError:
                 return mx.distributed.all_sum(g) / world
         return g
-    return nn.utils.tree_map(_reduce, grads)
+    return tree_map(_reduce, grads)
 
 def grad_norm_from_tree(tree) -> float:
     flats = []
@@ -239,7 +240,7 @@ def grad_norm_from_tree(tree) -> float:
         if isinstance(x, mx.array):
             flats.append(x)
         return x
-    nn.utils.tree_map(collect, tree)
+    tree_map(collect, tree)
     if not flats:
         return 0.0
     mx.eval(*flats)
@@ -253,7 +254,7 @@ def clip_global(tree, max_norm):
     if max_norm <= 0 or gnorm <= max_norm:
         return tree, gnorm
     scale = max_norm / (gnorm + 1e-6)
-    clipped = nn.utils.tree_map(
+    clipped = tree_map(
         lambda x: x * scale if isinstance(x, mx.array) else x,
         tree,
     )
@@ -338,8 +339,12 @@ def _broadcast_from_rank0(model: nn.Module, rank: int):
         if not isinstance(x, mx.array):
             return x
         x0 = x if rank == 0 else mx.zeros_like(x)
-        return mx.distributed.all_sum(x0)
-    bcast = nn.utils.tree_map(push, model.parameters())
+        # Broadcast on CPU stream to avoid Metal GPU timeout
+        try:
+            return mx.distributed.all_sum(x0, stream=mx.cpu)
+        except TypeError:
+            return mx.distributed.all_sum(x0)
+    bcast = tree_map(push, model.parameters())
     model.update(bcast)
     mx.eval(model.parameters())
 
@@ -481,16 +486,16 @@ def train_hf_distributed(
 
         def _bad(g):
             return isinstance(g, mx.array) and (bool(mx.isnan(g).any()) or bool(mx.isinf(g).any()))
-        if any(_bad(g) for g in nn.utils.tree_map(lambda x: x, grads)):
+        if any(_bad(g) for g in tree_map(lambda x: x, grads)):
             if rank == 0:
                 print(f"[{update_step}] ⚠️ NaN/Inf grads; skipping micro-step")
             continue
 
-        grads = nn.utils.tree_map(
+        grads = tree_map(
             lambda g: g / accum_steps if isinstance(g, mx.array) else g,
             grads,
         )
-        accum_grads = grads if accum_grads is None else nn.utils.tree_map(
+        accum_grads = grads if accum_grads is None else tree_map(
             lambda a, g: a + g if isinstance(a, mx.array) else a,
             accum_grads,
             grads,
