@@ -335,6 +335,9 @@ def load_safetensors_model(path: str, model: nn.Module) -> bool:
 # ---------- broadcast-from-rank-0 helper ----------
 
 def _broadcast_from_rank0(model: nn.Module, rank: int):
+    # Helpful logs to see which rank is doing what
+    print(f"[rank {rank}] starting _broadcast_from_rank0", flush=True)
+
     def push(x):
         if not isinstance(x, mx.array):
             return x
@@ -344,9 +347,12 @@ def _broadcast_from_rank0(model: nn.Module, rank: int):
             return mx.distributed.all_sum(x0, stream=mx.cpu)
         except TypeError:
             return mx.distributed.all_sum(x0)
+
     bcast = tree_map(push, model.parameters())
     model.update(bcast)
     mx.eval(model.parameters())
+
+    print(f"[rank {rank}] finished _broadcast_from_rank0", flush=True)
 
 # ---------- fwd+bwd (microstep) ----------
 
