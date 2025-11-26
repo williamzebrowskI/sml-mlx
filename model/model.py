@@ -1,13 +1,23 @@
 # model/model.py
 # A ~25M-parameter LM in MLX with HF streaming + ring DDP,
-# using a simple byte-level tokenizer (no external SPM files).
+# using a SentencePiece BPE tokenizer ONLY (no byte-tokenizer fallback).
+# Upgrades:
+# - RMSNorm + SiLU + RoPE
+# - Background prefetch for batches
+# - KV-cache for fast inference
+# - safetensors save/load + resume with rank-0 broadcast
+# - Runtime PAD/MASK ids follow the active SPM tokenizer
 
 import os
 os.environ.setdefault("MX_MAX_INFLIGHT_CMDS", "1")
 
-import math, time, json, gzip, requests, argparse
+import math, time, json, gzip, requests, argparse, threading, queue
 from dataclasses import dataclass
-from typing import List, Optional, Iterator, Tuple
+from typing import List, Optional, Tuple
+
+import numpy as np
+from safetensors.numpy import load_file as safetensors_load  # loading .safetensors
+import sentencepiece as spm
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,51 +25,55 @@ import mlx.nn.losses as losses
 import mlx.optimizers as optim
 
 # ---------------------------
-# Byte-level tokenizer + specials
+# SentencePiece tokenizer (BPE) wrapper
 # ---------------------------
 
-SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>"]
-PAD_ID, BOS_ID, EOS_ID = 0, 1, 2
-
-class ByteTokenizer:
-    def __init__(self):
-        self.special = {tok: i for i, tok in enumerate(SPECIAL_TOKENS)}
-        self.offset = len(SPECIAL_TOKENS)
-        self.vocab_size = self.offset + 256  # byte tokens
+class SPMTokenizer:
+    def __init__(self, model_path: str):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"SPM model not found: {model_path}")
+        self.sp = spm.SentencePieceProcessor(model_file=model_path)
+        self.pad_id = self.sp.pad_id()
+        self.bos_id = self.sp.bos_id()
+        self.eos_id = self.sp.eos_id()
+        self.vocab_size = self.sp.vocab_size()
+        if self.pad_id is None or self.pad_id < 0:
+            self.pad_id = 0
 
     def encode(self, s: str) -> List[int]:
-        ids = [self.special["<BOS>"]]
-        ids += [self.offset + b for b in s.encode("utf-8")]
-        ids += [self.special["<EOS>"]]
+        ids = [self.bos_id]
+        ids += self.sp.encode(s, out_type=int)
+        ids += [self.eos_id]
         return ids
 
     def decode(self, ids: List[int]) -> str:
-        bytes_out: List[int] = []
-        for t in ids:
-            if t < self.offset:
-                continue
-            b = t - self.offset
-            if 0 <= b < 256:
-                bytes_out.append(b)
-        return bytes(bytes_out).decode("utf-8", errors="ignore")
+        core = [t for t in ids if t not in (self.pad_id, self.bos_id, self.eos_id)]
+        return self.sp.decode(core)
 
-TOK = ByteTokenizer()
-VOCAB_SIZE = TOK.vocab_size
-PAD_ID = PAD_ID
-mask_id_for_loss = PAD_ID
+# ------- global tokenizer (SPM only) -------
+TOK: SPMTokenizer
+VOCAB_SIZE: int
+PAD_ID_RUNTIME: int
+MASK_ID_FOR_LOSS: int
 
-# ---------------------------
-# Sinusoidal positions (param-free)
-# ---------------------------
-
-def sinusoidal_positions(T: int, D: int) -> mx.array:
-    pos = mx.arange(T, dtype=mx.float32)[:, None]
-    i   = mx.arange(D, dtype=mx.float32)[None, :]
-    angle = pos / (10000 ** (2 * (i // 2) / D))
-    return mx.where((i % 2) == 0, mx.sin(angle), mx.cos(angle))  # (T, D)
+def set_tokenizer(spm_path: str):
+    """Require an SPM model and initialize globals."""
+    global TOK, VOCAB_SIZE, PAD_ID_RUNTIME, MASK_ID_FOR_LOSS
+    TOK = SPMTokenizer(spm_path)
+    VOCAB_SIZE = TOK.vocab_size
+    PAD_ID_RUNTIME = TOK.pad_id
+    MASK_ID_FOR_LOSS = PAD_ID_RUNTIME
+    print(f"[tok] Using SentencePiece BPE: {spm_path} (vocab={VOCAB_SIZE}, pad_id={PAD_ID_RUNTIME})", flush=True)
 
 # ---------------------------
-# Transformer (fast SDPA + cached additive mask)
+# RoPE helper (per-head dim)
+# ---------------------------
+
+def make_rope(head_dim: int, base: float = 10000.0):
+    return nn.RoPE(head_dim, base=base)
+
+# ---------------------------
+# Transformer (fast SDPA + cached additive mask) with RoPE
 # ---------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -71,42 +85,56 @@ class CausalSelfAttention(nn.Module):
         self.qkv  = nn.Linear(d_model, 3 * d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model,    bias=False)
         self.max_seq = max_seq
-        # cached additive causal mask (T,T) → broadcastable
         self._mask = nn.MultiHeadAttention.create_additive_causal_mask(max_seq)
+        self.rope = make_rope(self.dh, base=10000.0)
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, cache: Optional[Tuple[mx.array, mx.array]] = None) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
         B, T, D = x.shape
-        qkv = self.qkv(x)                              # (B,T,3D)
-        q, k, v = mx.split(qkv, 3, axis=-1)           # (B,T,D) each
+        qkv = self.qkv(x)
+        q, k, v = mx.split(qkv, 3, axis=-1)
 
         def split_heads(t):
-            t = t.reshape(B, T, self.h, self.dh)      # (B,T,H,dh)
-            return t.transpose(0, 2, 1, 3)            # (B,H,T,dh)
+            t = t.reshape(B, T, self.h, self.dh)
+            return t.transpose(0, 2, 1, 3)
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
+        q = self.rope(q)
+        k = self.rope(k)
 
-        mask = self._mask[:T, :T]                     # (T,T) additive
+        if cache is not None:
+            k_cache, v_cache = cache
+            if k_cache is not None and v_cache is not None:
+                k = mx.concatenate([k_cache, k], axis=2)
+                v = mx.concatenate([v_cache, v], axis=2)
+
+        Tq = q.shape[2]
+        Tk = k.shape[2]
+        mask = self._mask[:Tq, :Tk]
+
         attn = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=1.0 / math.sqrt(self.dh), mask=mask
-        )                                             # (B,H,T,dh)
-        ctx = attn.transpose(0, 2, 1, 3).reshape(B, T, D)
-        return self.proj(ctx)
+        )
+        ctx = attn.transpose(0, 2, 1, 3).reshape(B, Tq, D)
+        out = self.proj(ctx)
+        return out, (k, v)
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, max_seq: int, mlp_mult=4):
         super().__init__()
-        self.ln1  = nn.LayerNorm(d_model)
+        self.ln1  = nn.RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, max_seq)
-        self.ln2  = nn.LayerNorm(d_model)
+        self.ln2  = nn.RMSNorm(d_model)
         self.ffn  = nn.Sequential(
             nn.Linear(d_model, mlp_mult * d_model, bias=False),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(mlp_mult * d_model, d_model, bias=False),
         )
-    def __call__(self, x: mx.array) -> mx.array:
-        x = x + self.attn(self.ln1(x))
+
+    def __call__(self, x: mx.array, cache: Optional[Tuple[mx.array, mx.array]] = None) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
+        a, new_cache = self.attn(self.ln1(x), cache=cache)
+        x = x + a
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x, new_cache
 
 @dataclass
 class TinyGPConfig:
@@ -118,37 +146,47 @@ class TinyGPConfig:
     max_grad_norm: float = 1.0
 
 class TinyGPLM(nn.Module):
-    """
-    Causal LM with tied output head (~25–50M params depending on vocab/dim).
-    """
     def __init__(self, cfg: TinyGPConfig):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.blocks  = nn.Sequential(*[
-            TransformerBlock(cfg.d_model, cfg.n_heads, cfg.max_seq) for _ in range(cfg.n_layers)
-        ])
-        self.ln_f    = nn.LayerNorm(cfg.d_model)
+        self.blocks  = [TransformerBlock(cfg.d_model, cfg.n_heads, cfg.max_seq) for _ in range(cfg.n_layers)]
+        self.ln_f    = nn.RMSNorm(cfg.d_model)
         self.out_bias = mx.zeros((cfg.vocab_size,))
-        self.pos_cache = sinusoidal_positions(cfg.max_seq, cfg.d_model)
+        self.pos_cache = None  # RoPE handles positions
 
     def logits(self, x_ids: mx.array) -> mx.array:
         B, T = x_ids.shape
-        x = self.tok_emb(x_ids) + self.pos_cache[:T, :][None, :, :]
-        x = self.blocks(x)
-        x = self.ln_f(x)                               # (B,T,D)
-        W = self.tok_emb.weight                        # (V,D)
-        return mx.matmul(x, W.transpose(1, 0)) + self.out_bias  # (B,T,V)
+        x = self.tok_emb(x_ids)
+        for blk in self.blocks:
+            x, _ = blk(x, cache=None)
+        x = self.ln_f(x)
+        W = self.tok_emb.weight
+        return mx.matmul(x, W.transpose(1, 0)) + self.out_bias
 
     def __call__(self, x_ids: mx.array, targets: Optional[mx.array] = None):
         lg = self.logits(x_ids)
         if targets is None:
             return {"logits": lg}
-        ce = losses.cross_entropy(lg, targets, reduction="none")   # (B,T)
-        # Mask PADs (or EOS fallback set in batcher)
-        mask = (targets != mask_id_for_loss).astype(mx.float32)
+        ce = losses.cross_entropy(lg, targets, reduction="none")
+        mask = (targets != MASK_ID_FOR_LOSS).astype(mx.float32)
         loss = (ce * mask).sum() / (mask.sum() + 1e-6)
         return {"logits": lg, "loss": loss}
+
+    def step(self, tok_id: mx.array, caches: Optional[List[Tuple[mx.array, mx.array]]]) -> Tuple[mx.array, List[Tuple[mx.array, mx.array]]]:
+        B, L = tok_id.shape
+        assert L == 1
+        x = self.tok_emb(tok_id)
+        if caches is None:
+            caches = [None] * len(self.blocks)
+        new_caches = []
+        for blk, cache in zip(self.blocks, caches):
+            x, new_cache = blk(x, cache=cache)
+            new_caches.append(new_cache)
+        x = self.ln_f(x)
+        W = self.tok_emb.weight
+        logits = mx.matmul(x, W.transpose(1, 0)).squeeze(axis=1) + self.out_bias
+        return logits, new_caches
 
 # ---------------------------
 # HF streaming helpers
@@ -157,11 +195,16 @@ class TinyGPLM(nn.Module):
 def hf_text_iterator(name, config, split, field, world_size, rank, trust_remote_code=False):
     from datasets import load_dataset
     ds = load_dataset(name, config, split=split, streaming=True, trust_remote_code=trust_remote_code)
-    i = 0
-    for ex in ds:
-        if i % world_size == rank:
+    try:
+        ds = ds.shard(num_shards=world_size, index=rank)
+        for ex in ds:
             yield {"text": ex.get(field, "")}
-        i += 1
+    except Exception:
+        i = 0
+        for ex in ds:
+            if i % world_size == rank:
+                yield {"text": ex.get(field, "")}
+            i += 1
 
 # ---------------------------
 # Distributed + utils
@@ -169,8 +212,8 @@ def hf_text_iterator(name, config, split, field, world_size, rank, trust_remote_
 
 def init_dist(backend="ring", expected_world=None):
     group = mx.distributed.init(backend=backend)
-    size = group.size() if callable(getattr(group,"size",None)) else int(getattr(group,"size",1))
-    rank = group.rank() if callable(getattr(group,"rank",None)) else int(getattr(group,"rank",0))
+    size = group.size() if callable(getattr(group, "size", None)) else int(getattr(group, "size", 1))
+    rank = group.rank() if callable(getattr(group, "rank", None)) else int(getattr(group, "rank", 0))
     print(f"[boot] rank={rank} size={size} backend={backend}", flush=True)
     if expected_world is not None and size != expected_world:
         raise RuntimeError(f"Expected world size {expected_world}, got {size}")
@@ -179,7 +222,8 @@ def init_dist(backend="ring", expected_world=None):
     return group, size, rank
 
 def allreduce_grads(grads, world):
-    if world == 1: return grads
+    if world == 1:
+        return grads
     def _reduce(g):
         if isinstance(g, mx.array):
             try:
@@ -189,13 +233,131 @@ def allreduce_grads(grads, world):
         return g
     return nn.utils.tree_map(_reduce, grads)
 
+def grad_norm_from_tree(tree) -> float:
+    flats = []
+    def collect(x):
+        if isinstance(x, mx.array):
+            flats.append(x)
+        return x
+    nn.utils.tree_map(collect, tree)
+    if not flats:
+        return 0.0
+    mx.eval(*flats)
+    total_sq = 0.0
+    for g in flats:
+        total_sq += float((g * g).sum())
+    return math.sqrt(total_sq)
+
 def clip_global(tree, max_norm):
-    flats = [l for l in nn.utils.tree_map(lambda x: x, tree) if isinstance(l, mx.array)]
-    total = math.sqrt(sum(float((g**2).sum()) for g in flats))
-    if max_norm <= 0 or total <= max_norm:
-        return tree, total
-    scale = max_norm / (total + 1e-6)
-    return nn.utils.tree_map(lambda x: x * scale if isinstance(x, mx.array) else x, tree), total
+    gnorm = grad_norm_from_tree(tree)
+    if max_norm <= 0 or gnorm <= max_norm:
+        return tree, gnorm
+    scale = max_norm / (gnorm + 1e-6)
+    clipped = nn.utils.tree_map(
+        lambda x: x * scale if isinstance(x, mx.array) else x,
+        tree,
+    )
+    return clipped, gnorm
+
+# ---------- safetensors save/load ----------
+
+def flatten_params(obj, prefix=""):
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else k
+            flat.update(flatten_params(v, key))
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            key = f"{prefix}.{i}" if prefix else str(i)
+            flat.update(flatten_params(v, key))
+    elif isinstance(obj, mx.array):
+        key = prefix if prefix else "param"
+        flat[key] = obj
+    return flat
+
+def save_safetensors_model(path: str, model: nn.Module):
+    flat = flatten_params(model.parameters())
+    if not flat:
+        print(f"[save] ⚠️ no tensors to save for {path}", flush=True)
+        return False
+    try:
+        mx.save_safetensors(path, flat)
+        print(f"[save] wrote {path} ({len(flat)} tensors)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[save] ❌ safetensors failed for {path}: {e!r}", flush=True)
+        return False
+
+def load_safetensors_model(path: str, model: nn.Module) -> bool:
+    if not os.path.exists(path):
+        print(f"[load] ❌ checkpoint not found: {path}", flush=True)
+        return False
+    try:
+        np_flat = safetensors_load(path)
+    except Exception as e:
+        print(f"[load] ❌ failed to read {path}: {e!r}", flush=True)
+        return False
+
+    def assign(tree, prefix=""):
+        if isinstance(tree, dict):
+            out = {}
+            for k, v in tree.items():
+                key = f"{prefix}.{k}" if prefix else k
+                out[k] = assign(v, key)
+            return out
+        elif isinstance(tree, (list, tuple)):
+            out = []
+            for i, v in enumerate(tree):
+                key = f"{prefix}.{i}" if prefix else str(i)
+                out.append(assign(v, key))
+            return type(tree)(out)
+        elif isinstance(tree, mx.array):
+            key = prefix if prefix else "param"
+            if key in np_flat:
+                arr = np_flat[key]
+                t = mx.array(arr)
+                if tuple(t.shape) != tuple(tree.shape):
+                    print(f"[load] ⚠️ shape mismatch for {key}: file {t.shape} vs model {tree.shape}", flush=True)
+                return t.astype(tree.dtype)
+            else:
+                return tree
+        else:
+            return tree
+
+    updated = assign(model.parameters())
+    model.update(updated)
+    mx.eval(model.parameters())
+    print(f"[load] loaded {len(np_flat)} tensors from {path}", flush=True)
+    return True
+
+# ---------- broadcast-from-rank-0 helper ----------
+
+def _broadcast_from_rank0(model: nn.Module, rank: int):
+    def push(x):
+        if not isinstance(x, mx.array):
+            return x
+        x0 = x if rank == 0 else mx.zeros_like(x)
+        return mx.distributed.all_sum(x0)
+    bcast = nn.utils.tree_map(push, model.parameters())
+    model.update(bcast)
+    mx.eval(model.parameters())
+
+# ---------- fwd+bwd (microstep) ----------
+
+def _make_compiled_step(model: nn.Module):
+    """
+    Build a per-microstep function that returns (loss, grads) and
+    matches the call pattern: step(X, Y).
+    We intentionally do NOT mx.compile this, because combining
+    mx.compile + nn.value_and_grad has been unstable in some setups.
+    """
+    def loss_fn(x, y):
+        return model(x, y)["loss"]
+
+    # This wires gradients w.r.t. model.trainable_parameters()
+    step = nn.value_and_grad(model, loss_fn)
+    return step
 
 # ---------------------------
 # Training
@@ -220,8 +382,9 @@ def train_hf_distributed(
     save_dir: str = "model/checkpoints_spm",
     save_every: int = 5_000,
     eval_every: int = 0,
-    eval_prompt: str = "Hello, world. ",
+    eval_prompt: str = "Hello, my name is ",
     eval_tokens: int = 50,
+    resume_ckpt: Optional[str] = None,
 ):
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
     print(f"[rank {rank}] entering train_hf_distributed", flush=True)
@@ -232,36 +395,46 @@ def train_hf_distributed(
     mx.eval(model.parameters())
     print(f"[rank {rank}] model initialized (vocab={VOCAB_SIZE}, d_model={cfg.d_model}, layers={cfg.n_layers})", flush=True)
 
-    # sync weights across ranks
+    # step bound to this model; it will be callable as step(X, Y)
+    step = _make_compiled_step(model)
+
+    update_step = 0
+    if resume_ckpt and rank == 0:
+        if load_safetensors_model(resume_ckpt, model):
+            try:
+                stem = os.path.splitext(os.path.basename(resume_ckpt))[0]
+                update_step = int(stem.split("_")[-1])
+            except Exception:
+                update_step = 0
+            print(f"[rank 0] resume from {resume_ckpt} at step {update_step}", flush=True)
+        else:
+            print(f"[rank 0] resume requested but failed, training from scratch", flush=True)
+    mx.eval(model.parameters())
     if world > 1:
-        print(f"[rank {rank}] syncing initial weights across ranks", flush=True)
-        synced = nn.utils.tree_map(lambda p: (mx.distributed.all_sum(p) / world) if isinstance(p, mx.array) else p,
-                                   model.parameters())
-        model.update(synced); mx.eval(model.parameters())
+        print(f"[rank {rank}] broadcasting parameters from rank 0", flush=True)
+        _broadcast_from_rank0(model, rank)
 
     opt = optim.AdamW(lr, weight_decay=wd)
-    get_vg = nn.value_and_grad(model, lambda m, x, y: m(x, y)["loss"])
 
-    print(f"[rank {rank}] creating HF iterator: dataset={dataset_name} config={dataset_config} split={split}", flush=True)
     sample_iter = hf_text_iterator(dataset_name, dataset_config, split, text_field, world, rank, trust_remote_code)
-    print(f"[rank {rank}] HF iterator ready, starting batch loop", flush=True)
 
-    # Batcher with SPM, padding with PAD_ID (or EOS fallback) and masking in loss
     def batch_iterator():
         X = mx.zeros((batch_size, seq_len), dtype=mx.int32)
         Y = mx.zeros((batch_size, seq_len), dtype=mx.int32)
         filled = 0
         for ex in sample_iter:
-            text = ex.get("text","")
-            if not text: continue
+            text = ex.get("text", "")
+            if not text:
+                continue
             ids = TOK.encode(text)
-            if len(ids) < 2: continue
+            if len(ids) < 2:
+                continue
             ids = ids[: seq_len + 1]
             x_ids, y_ids = ids[:-1], ids[1:]
             if len(x_ids) < seq_len:
                 pad = seq_len - len(x_ids)
-                x_ids = x_ids + [PAD_ID] * pad
-                y_ids = y_ids + [PAD_ID] * pad
+                x_ids = x_ids + [PAD_ID_RUNTIME] * pad
+                y_ids = y_ids + [PAD_ID_RUNTIME] * pad
             X[filled] = mx.array(x_ids, dtype=mx.int32)
             Y[filled] = mx.array(y_ids, dtype=mx.int32)
             filled += 1
@@ -271,24 +444,41 @@ def train_hf_distributed(
                 Y = mx.zeros((batch_size, seq_len), dtype=mx.int32)
                 filled = 0
 
-    os.makedirs(save_dir, exist_ok=True)
+    def make_prefetcher(batch_iter, maxsize=8):
+        q = queue.Queue(maxsize=maxsize)
+        def _runner():
+            for xy in batch_iter():
+                q.put(xy)
+            q.put(None)
+        th = threading.Thread(target=_runner, daemon=True)
+        th.start()
+        def _get():
+            item = q.get()
+            if item is None:
+                return None, None
+            return item
+        return _get
 
-    update_step = 0
+    next_batch = make_prefetcher(batch_iterator, maxsize=8)
+
     micro_accum = 0
     accum_grads = None
     last = time.time()
 
-    for X, Y in batch_iterator():
-        if update_step == 0 and micro_accum == 0:
-            print(f"[rank {rank}] first batch received, shapes X={X.shape} Y={Y.shape}", flush=True)
-        loss, grads = get_vg(model, X, Y)
+    for _ in range(max_steps * max(1, accum_steps) * 10**9):
+        X, Y = next_batch()
+        if X is None:
+            break
+
+        # step expects X, Y as separate arguments
+        loss, grads = step(X, Y)
         mx.eval(loss, grads)
 
-        # NaN/Inf guards
         if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
             if rank == 0:
                 print(f"[{update_step}] ⚠️ NaN/Inf loss; skipping micro-step")
             continue
+
         def _bad(g):
             return isinstance(g, mx.array) and (bool(mx.isnan(g).any()) or bool(mx.isinf(g).any()))
         if any(_bad(g) for g in nn.utils.tree_map(lambda x: x, grads)):
@@ -296,10 +486,14 @@ def train_hf_distributed(
                 print(f"[{update_step}] ⚠️ NaN/Inf grads; skipping micro-step")
             continue
 
-        # accumulate
-        grads = nn.utils.tree_map(lambda g: g / accum_steps if isinstance(g, mx.array) else g, grads)
+        grads = nn.utils.tree_map(
+            lambda g: g / accum_steps if isinstance(g, mx.array) else g,
+            grads,
+        )
         accum_grads = grads if accum_grads is None else nn.utils.tree_map(
-            lambda a, g: a + g if isinstance(a, mx.array) else a, accum_grads, grads
+            lambda a, g: a + g if isinstance(a, mx.array) else a,
+            accum_grads,
+            grads,
         )
         micro_accum += 1
 
@@ -308,32 +502,35 @@ def train_hf_distributed(
             clipped, gnorm = clip_global(global_grads, model.cfg.max_grad_norm)
             opt.update(model, clipped)
             mx.eval(model.parameters(), opt.state)
-            if update_step == 0:
-                print(f"[rank {rank}] first optimizer step applied", flush=True)
 
             now = time.time()
-            dt = now - last; last = now
+            dt = now - last
+            last = now
             if update_step % log_every == 0:
                 toks_local_s = (batch_size * seq_len * accum_steps) / max(1e-9, dt)
                 ppl = math.exp(min(20.0, float(loss.item())))
+                lr_cur = getattr(opt, "learning_rate", None)
+                lr_str = f" lr={lr_cur:.2e}" if lr_cur is not None else ""
                 if per_rank_logs:
-                    print(f"[{update_step}] rank={rank} loss={loss.item():.4f} ppl={ppl:.2f} grad_norm={gnorm:.3f} tok/s={toks_local_s:.0f}")
+                    print(f"[{update_step}] rank={rank} loss={loss.item():.4f} "
+                          f"ppl={ppl:.2f} grad_norm={gnorm:.3f}{lr_str} "
+                          f"tok/s={toks_local_s:.0f}")
                 if rank == 0 and not per_rank_logs:
-                    print(f"[{update_step}] loss={loss.item():.4f} ppl={ppl:.2f} grad_norm={gnorm:.3f} tok/s≈{toks_local_s*world:.0f}")
-
-            if rank == 0 and eval_every and update_step % eval_every == 0:
-                try:
-                    print(f"[{update_step}] sample:\n{generate(model, eval_prompt, 64)}\n---")
-                except Exception as e:
-                    print(f"[{update_step}] eval failed: {e}")
+                    print(f"[{update_step}] loss={loss.item():.4f} ppl={ppl:.2f} "
+                          f"grad_norm={gnorm:.3f}{lr_str} "
+                          f"tok/s≈{toks_local_s * world:.0f}")
 
             if rank == 0 and update_step > 0 and update_step % save_every == 0:
                 path = os.path.join(save_dir, f"ckpt_{update_step:06d}.safetensors")
+                ok = save_safetensors_model(path, model)
+                if not ok:
+                    print(f"[{update_step}] ⚠️ checkpoint NOT written: {path}", flush=True)
+
+            if rank == 0 and eval_every and update_step % eval_every == 0:
                 try:
-                    mx.save_safetensors(path, model.parameters())
-                    print(f"[{update_step}] saved {path}")
+                    run_eval_samples(model, update_step, eval_prompt, eval_tokens)
                 except Exception as e:
-                    print(f"[{update_step}] safetensors save failed ({e}); checkpoint NOT written")
+                    print(f"[{update_step}] eval failed: {e}")
 
             update_step += 1
             micro_accum = 0
@@ -343,37 +540,150 @@ def train_hf_distributed(
 
     if rank == 0:
         final_path = os.path.join(save_dir, "ckpt_final.safetensors")
-        try:
-            mx.save_safetensors(final_path, model.parameters())
-            print(f"[final] saved {final_path}")
-        except Exception as e:
-            print(f"[final] safetensors save failed ({e}); final checkpoint NOT written")
+        ok = save_safetensors_model(final_path, model)
+        if not ok:
+            print(f"[final] ⚠️ final checkpoint NOT written: {final_path}", flush=True)
 
 # ---------------------------
-# Simple greedy generator
+# Generators (KV-cache aware)
 # ---------------------------
 
-def generate(model: TinyGPLM, prompt: str, max_new_tokens=128):
+def _sample_next_token(logits: mx.array, temperature: float = 1.0,
+                       top_k: int | None = None, top_p: float | None = None) -> int:
+    logits = logits / max(1e-5, temperature)
+    probs = mx.softmax(logits, axis=-1)
+    probs_np = probs[0].tolist()
+    if top_k is not None and top_k > 0 and top_k < len(probs_np):
+        idxs = sorted(range(len(probs_np)), key=lambda i: probs_np[i], reverse=True)
+        keep = set(idxs[:top_k])
+        total = sum(probs_np[i] for i in keep)
+        probs_np = [p / total if i in keep else 0.0 for i, p in enumerate(probs_np)]
+    if top_p is not None and 0.0 < top_p < 1.0:
+        idxs = sorted(range(len(probs_np)), key=lambda i: probs_np[i], reverse=True)
+        cumulative = 0.0
+        keep = []
+        for i in idxs:
+            cumulative += probs_np[i]
+            keep.append(i)
+            if cumulative >= top_p:
+                break
+        keep = set(keep)
+        total = sum(probs_np[i] for i in keep)
+        probs_np = [p / total if i in keep else 0.0 for i, p in enumerate(probs_np)]
+    import random
+    r = random.random()
+    c = 0.0
+    for i, p in enumerate(probs_np):
+        c += p
+        if r <= c:
+            return i
+    return int(mx.argmax(probs, axis=-1).item())
+
+def generate_greedy_nocache(model: TinyGPLM, prompt: str, max_new_tokens: int = 128) -> str:
     ids = TOK.encode(prompt)[: model.cfg.max_seq]
-    stop_id = EOS_ID
-    x = mx.array([ids], dtype=mx.int32)
+    out_ids = ids[:]
     for _ in range(max_new_tokens):
-        logits = model.logits(x)[:, -1, :]            # (1,V)
-        next_id = int(mx.argmax(logits, axis=-1).item())
-        ids.append(next_id)
-        if stop_id is not None and next_id == stop_id:
+        x_ids = mx.array([out_ids[:model.cfg.max_seq]], dtype=mx.int32)  # shape (1, T)
+        logits = model.logits(x_ids)  # (1, T, vocab)
+        last_logits = logits[:, -1, :]  # (1, vocab)
+        next_id = int(mx.argmax(last_logits, axis=-1).item())
+        out_ids.append(next_id)
+        if next_id == TOK.eos_id:
             break
-        x = mx.array([ids[-model.cfg.max_seq:]], dtype=mx.int32)
-    return TOK.decode(ids)
+    return TOK.decode(out_ids)
+
+def generate_topk(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
+                  temperature: float = 0.8, top_k: int = 40) -> str:
+    ids = TOK.encode(prompt)[: model.cfg.max_seq]
+    caches = None
+    for tok in ids[:-1]:
+        tok_id = mx.array([[tok]], dtype=mx.int32)
+        _, caches = model.step(tok_id, caches)
+    cur = mx.array([[ids[-1]]], dtype=mx.int32)
+    out_ids = ids[:]
+    for _ in range(max_new_tokens):
+        logits, caches = model.step(cur, caches)
+        next_id = _sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=None)
+        out_ids.append(int(next_id))
+        if next_id == TOK.eos_id:
+            break
+        cur = mx.array([[next_id]], dtype=mx.int32)
+    return TOK.decode(out_ids)
+
+def generate_topp(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
+                  temperature: float = 0.8, top_p: float = 0.9) -> str:
+    ids = TOK.encode(prompt)[: model.cfg.max_seq]
+    caches = None
+    for tok in ids[:-1]:
+        tok_id = mx.array([[tok]], dtype=mx.int32)
+        _, caches = model.step(tok_id, caches)
+    cur = mx.array([[ids[-1]]], dtype=mx.int32)
+    out_ids = ids[:]
+    for _ in range(max_new_tokens):
+        logits, caches = model.step(cur, caches)
+        next_id = _sample_next_token(logits, temperature=temperature, top_k=None, top_p=top_p)
+        out_ids.append(int(next_id))
+        if next_id == TOK.eos_id:
+            break
+        cur = mx.array([[next_id]], dtype=mx.int32)
+    return TOK.decode(out_ids)
+
+def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: int):
+    print(f"[{step}] === EVAL SAMPLES ===")
+    print(f"Prompt: {repr(prompt)}")
+
+    # 1) Pure greedy
+    greedy_nocache = generate_greedy_nocache(model, prompt, max_new_tokens)
+    print(f"[{step}] greedy (no cache):\n{greedy_nocache}\n---")
+
+    # 2) Top-k, fairly conservative
+    topk_20_t07 = generate_topk(
+        model,
+        prompt,
+        max_new_tokens,
+        temperature=0.7,
+        top_k=20,
+    )
+    print(f"[{step}] top-k (k=20, T=0.7):\n{topk_20_t07}\n---")
+
+    # 3) Top-k, more exploratory
+    topk_80_t10 = generate_topk(
+        model,
+        prompt,
+        max_new_tokens,
+        temperature=1.0,
+        top_k=80,
+    )
+    print(f"[{step}] top-k (k=80, T=1.0):\n{topk_80_t10}\n---")
+
+    # 4) Top-p (nucleus), conservative
+    topp_09_t07 = generate_topp(
+        model,
+        prompt,
+        max_new_tokens,
+        temperature=0.7,
+        top_p=0.9,
+    )
+    print(f"[{step}] top-p (p=0.9, T=0.7):\n{topp_09_t07}\n---")
+
+    # 5) Top-p, more exploratory
+    topp_095_t10 = generate_topp(
+        model,
+        prompt,
+        max_new_tokens,
+        temperature=1.0,
+        top_p=0.95,
+    )
+    print(f"[{step}] top-p (p=0.95, T=1.0):\n{topp_095_t10}\n---")
 
 # ---------------------------
 # CLI
 # ---------------------------
 
 def main():
-    p = argparse.ArgumentParser("Distributed MLX LM training (byte-level tokenizer)")
-    p.add_argument("--dataset", type=str, default="Skylion007/openwebtext")
-    p.add_argument("--dataset-config", type=str, default="plain_text")
+    p = argparse.ArgumentParser("Distributed MLX LM training (SPM BPE tokenizer only)")
+    p.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb")
+    p.add_argument("--dataset-config", type=str, default=None)
     p.add_argument("--split", type=str, default="train")
     p.add_argument("--text-field", type=str, default="text")
     p.add_argument("--trust-remote-code", action="store_true", default=True)
@@ -393,11 +703,18 @@ def main():
     p.add_argument("--save-dir", type=str, default="model/checkpoints_spm")
     p.add_argument("--save-every", type=int, default=5000)
     p.add_argument("--eval-every", type=int, default=0)
-    p.add_argument("--eval-prompt", type=str, default="Hello, world. ")
+    p.add_argument("--eval-prompt", type=str, default="Hello, my name is ")
     p.add_argument("--eval-tokens", type=int, default=50)
+    p.add_argument("--resume", type=str, default=None, help="Path to a .safetensors checkpoint to resume from")
+
+    p.add_argument("--spm-model", type=str, required=True,
+                   help="Path to tokenizer/fineweb_spm/spm.model")
+
     args = p.parse_args()
 
-    cfg = None if args.dataset_config in (None,"","None","none") else args.dataset_config
+    set_tokenizer(args.spm_model)
+
+    cfg = None if args.dataset_config in (None, "", "None", "none") else args.dataset_config
     train_hf_distributed(
         dataset_name=args.dataset,
         dataset_config=cfg,
@@ -419,6 +736,7 @@ def main():
         eval_every=args.eval_every,
         eval_prompt=args.eval_prompt,
         eval_tokens=args.eval_tokens,
+        resume_ckpt=args.resume,
     )
 
 if __name__ == "__main__":

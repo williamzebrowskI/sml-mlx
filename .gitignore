@@ -24,9 +24,11 @@ data/qa_prompt_completion
 # Model checkpoints
 model/checkpoints/
 model/checkpoints_owt/
+model/checkpoints_spm/
 model/lora_adapters
 runs/sml-lm/*.safetensors
 runs/sml-lm-100m/*.safetensors
+fineweb_sample.jsonl
 # Logs / experiment tracking
 wandb/
 logs/
