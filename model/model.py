@@ -400,6 +400,13 @@ def train_hf_distributed(
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
     print(f"[rank {rank}] entering train_hf_distributed", flush=True)
 
+    # Rank 0 uses full seq_len; other ranks use a shorter local_seq_len
+    if world > 1 and rank != 0:
+        local_seq_len = max(1, seq_len // 4)  # e.g., 2048 -> 512
+    else:
+        local_seq_len = seq_len
+    print(f"[rank {rank}] using local_seq_len={local_seq_len} (global seq_len={seq_len})", flush=True)
+
     cfg = TinyGPConfig(vocab_size=VOCAB_SIZE, d_model=384, n_heads=6, n_layers=12,
                        max_seq=seq_len, max_grad_norm=1.0)
     model = TinyGPLM(cfg)
@@ -430,8 +437,8 @@ def train_hf_distributed(
     sample_iter = hf_text_iterator(dataset_name, dataset_config, split, text_field, world, rank, trust_remote_code)
 
     def batch_iterator():
-        X = mx.zeros((batch_size, seq_len), dtype=mx.int32)
-        Y = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+        X = mx.zeros((batch_size, local_seq_len), dtype=mx.int32)
+        Y = mx.zeros((batch_size, local_seq_len), dtype=mx.int32)
         filled = 0
         for ex in sample_iter:
             text = ex.get("text", "")
@@ -440,10 +447,10 @@ def train_hf_distributed(
             ids = TOK.encode(text)
             if len(ids) < 2:
                 continue
-            ids = ids[: seq_len + 1]
+            ids = ids[: local_seq_len + 1]
             x_ids, y_ids = ids[:-1], ids[1:]
-            if len(x_ids) < seq_len:
-                pad = seq_len - len(x_ids)
+            if len(x_ids) < local_seq_len:
+                pad = local_seq_len - len(x_ids)
                 x_ids = x_ids + [PAD_ID_RUNTIME] * pad
                 y_ids = y_ids + [PAD_ID_RUNTIME] * pad
             X[filled] = mx.array(x_ids, dtype=mx.int32)
@@ -451,8 +458,8 @@ def train_hf_distributed(
             filled += 1
             if filled == batch_size:
                 yield X, Y
-                X = mx.zeros((batch_size, seq_len), dtype=mx.int32)
-                Y = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+                X = mx.zeros((batch_size, local_seq_len), dtype=mx.int32)
+                Y = mx.zeros((batch_size, local_seq_len), dtype=mx.int32)
                 filled = 0
 
     def make_prefetcher(batch_iter, maxsize=8):
@@ -518,7 +525,7 @@ def train_hf_distributed(
             dt = now - last
             last = now
             if update_step % log_every == 0:
-                toks_local_s = (batch_size * seq_len * accum_steps) / max(1e-9, dt)
+                toks_local_s = (batch_size * local_seq_len * accum_steps) / max(1e-9, dt)
                 ppl = math.exp(min(20.0, float(loss.item())))
                 lr_cur = getattr(opt, "learning_rate", None)
                 lr_str = f" lr={lr_cur:.2e}" if lr_cur is not None else ""
