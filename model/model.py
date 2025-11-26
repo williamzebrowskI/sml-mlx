@@ -234,27 +234,6 @@ def allreduce_grads(grads, world):
         return g
     return tree_map(_reduce, grads)
 
-# def grad_norm_from_tree(tree) -> float:
-#     """
-#     Compute global grad norm on CPU to avoid heavy GPU work that can
-#     trigger Metal timeouts when multiple ranks are active.
-#     """
-#     total_sq = 0.0
-
-#     def collect_and_accumulate(x):
-#         nonlocal total_sq
-#         if isinstance(x, mx.array):
-#             # Move to CPU / NumPy and accumulate squared norm there.
-#             g_np = np.array(x)  # this will sync from device
-#             total_sq += float((g_np * g_np).sum())
-#         return x
-
-#     tree_map(collect_and_accumulate, tree)
-
-#     if total_sq == 0.0:
-#         return 0.0
-#     return math.sqrt(total_sq)
-
 def grad_norm_from_tree(tree) -> float:
     # Temporarily disabled to avoid GPU-heavy norm computation in multi-host
     return 0.0
@@ -511,8 +490,6 @@ def train_hf_distributed(
         mx.eval(loss, grads)
         print(f"[rank {rank}] finished mx.eval(loss, grads)", flush=True)
 
-        # --- NEW LOGGING BLOCK STARTS HERE ---
-
         # 1) NaN/Inf checks
         print(f"[rank {rank}] checking loss/grads for NaN/Inf", flush=True)
         if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
@@ -542,10 +519,9 @@ def train_hf_distributed(
         micro_accum += 1
 
         if micro_accum == accum_steps:
-            # 3) Allreduce grads
             global_grads = allreduce_grads(accum_grads, world)
 
-            # Disable clipping in multi-host to avoid Metal GPU timeout in norm calc
+            # Disable clipping in multi-host to avoid Metal GPU timeout
             max_norm = model.cfg.max_grad_norm
             if world > 1:
                 max_norm = 0.0
