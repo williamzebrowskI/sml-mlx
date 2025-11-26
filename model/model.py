@@ -487,6 +487,14 @@ def train_hf_distributed(
         X, Y = next_batch()
         if X is None:
             break
+        print(f"[rank {rank}] got batch X.shape={tuple(X.shape)}, Y.shape={tuple(Y.shape)}", flush=True)
+
+        print(f"[rank {rank}] calling step() for the first time", flush=True)
+        loss, grads = step(X, Y)
+        print(f"[rank {rank}] step() returned loss={loss} (before mx.eval)", flush=True)
+
+        mx.eval(loss, grads)
+        print(f"[rank {rank}] finished mx.eval(loss, grads)", flush=True)
 
         # step expects X, Y as separate arguments
         loss, grads = step(X, Y)
