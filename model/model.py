@@ -235,18 +235,24 @@ def allreduce_grads(grads, world):
     return tree_map(_reduce, grads)
 
 def grad_norm_from_tree(tree) -> float:
-    flats = []
-    def collect(x):
-        if isinstance(x, mx.array):
-            flats.append(x)
-        return x
-    tree_map(collect, tree)
-    if not flats:
-        return 0.0
-    mx.eval(*flats)
+    """
+    Compute global grad norm on CPU to avoid heavy GPU work that can
+    trigger Metal timeouts when multiple ranks are active.
+    """
     total_sq = 0.0
-    for g in flats:
-        total_sq += float((g * g).sum())
+
+    def collect_and_accumulate(x):
+        nonlocal total_sq
+        if isinstance(x, mx.array):
+            # Move to CPU / NumPy and accumulate squared norm there.
+            g_np = np.array(x)  # this will sync from device
+            total_sq += float((g_np * g_np).sum())
+        return x
+
+    tree_map(collect_and_accumulate, tree)
+
+    if total_sq == 0.0:
+        return 0.0
     return math.sqrt(total_sq)
 
 def clip_global(tree, max_norm):
