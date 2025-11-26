@@ -234,31 +234,41 @@ def allreduce_grads(grads, world):
         return g
     return tree_map(_reduce, grads)
 
+# def grad_norm_from_tree(tree) -> float:
+#     """
+#     Compute global grad norm on CPU to avoid heavy GPU work that can
+#     trigger Metal timeouts when multiple ranks are active.
+#     """
+#     total_sq = 0.0
+
+#     def collect_and_accumulate(x):
+#         nonlocal total_sq
+#         if isinstance(x, mx.array):
+#             # Move to CPU / NumPy and accumulate squared norm there.
+#             g_np = np.array(x)  # this will sync from device
+#             total_sq += float((g_np * g_np).sum())
+#         return x
+
+#     tree_map(collect_and_accumulate, tree)
+
+#     if total_sq == 0.0:
+#         return 0.0
+#     return math.sqrt(total_sq)
+
 def grad_norm_from_tree(tree) -> float:
-    """
-    Compute global grad norm on CPU to avoid heavy GPU work that can
-    trigger Metal timeouts when multiple ranks are active.
-    """
-    total_sq = 0.0
-
-    def collect_and_accumulate(x):
-        nonlocal total_sq
-        if isinstance(x, mx.array):
-            # Move to CPU / NumPy and accumulate squared norm there.
-            g_np = np.array(x)  # this will sync from device
-            total_sq += float((g_np * g_np).sum())
-        return x
-
-    tree_map(collect_and_accumulate, tree)
-
-    if total_sq == 0.0:
-        return 0.0
-    return math.sqrt(total_sq)
+    # Temporarily disabled to avoid GPU-heavy norm computation in multi-host
+    return 0.0
 
 def clip_global(tree, max_norm):
+    # No clipping requested
+    if max_norm <= 0:
+        return tree, 0.0
+
+    # If we ever re-enable this, do it carefully (CPU or rank-0 only)
     gnorm = grad_norm_from_tree(tree)
-    if max_norm <= 0 or gnorm <= max_norm:
+    if gnorm <= max_norm:
         return tree, gnorm
+
     scale = max_norm / (gnorm + 1e-6)
     clipped = tree_map(
         lambda x: x * scale if isinstance(x, mx.array) else x,
@@ -533,20 +543,15 @@ def train_hf_distributed(
 
         if micro_accum == accum_steps:
             # 3) Allreduce grads
-            print(f"[rank {rank}] entering allreduce_grads at step {update_step}", flush=True)
             global_grads = allreduce_grads(accum_grads, world)
-            print(f"[rank {rank}] finished allreduce_grads at step {update_step}", flush=True)
 
-            # 4) Clip global grad norm
-            print(f"[rank {rank}] entering clip_global at step {update_step}", flush=True)
-            clipped, gnorm = clip_global(global_grads, model.cfg.max_grad_norm)
-            print(f"[rank {rank}] finished clip_global at step {update_step} (grad_norm={gnorm})", flush=True)
+            # Disable clipping in multi-host to avoid Metal GPU timeout in norm calc
+            max_norm = model.cfg.max_grad_norm
+            if world > 1:
+                max_norm = 0.0
 
-            # 5) Optimizer update
-            print(f"[rank {rank}] entering opt.update at step {update_step}", flush=True)
+            clipped, gnorm = clip_global(global_grads, max_norm)
             opt.update(model, clipped)
-            mx.eval(model.parameters(), opt.state)
-            print(f"[rank {rank}] finished opt.update at step {update_step}", flush=True)
 
             now = time.time()
             dt = now - last
