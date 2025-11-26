@@ -487,31 +487,33 @@ def train_hf_distributed(
         X, Y = next_batch()
         if X is None:
             break
+
         print(f"[rank {rank}] got batch X.shape={tuple(X.shape)}, Y.shape={tuple(Y.shape)}", flush=True)
 
-        print(f"[rank {rank}] calling step() for the first time", flush=True)
         loss, grads = step(X, Y)
-        print(f"[rank {rank}] step() returned loss={loss} (before mx.eval)", flush=True)
-
+        print(f"[rank {rank}] step() returned loss={float(loss.item())} (before mx.eval)", flush=True)
         mx.eval(loss, grads)
         print(f"[rank {rank}] finished mx.eval(loss, grads)", flush=True)
 
-        # step expects X, Y as separate arguments
-        loss, grads = step(X, Y)
-        mx.eval(loss, grads)
+        # --- NEW LOGGING BLOCK STARTS HERE ---
 
+        # 1) NaN/Inf checks
+        print(f"[rank {rank}] checking loss/grads for NaN/Inf", flush=True)
         if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
             if rank == 0:
-                print(f"[{update_step}] ⚠️ NaN/Inf loss; skipping micro-step")
+                print(f"[{update_step}] ⚠️ NaN/Inf loss; skipping micro-step", flush=True)
             continue
 
         def _bad(g):
             return isinstance(g, mx.array) and (bool(mx.isnan(g).any()) or bool(mx.isinf(g).any()))
         if any(_bad(g) for g in tree_map(lambda x: x, grads)):
             if rank == 0:
-                print(f"[{update_step}] ⚠️ NaN/Inf grads; skipping micro-step")
+                print(f"[{update_step}] ⚠️ NaN/Inf grads; skipping micro-step", flush=True)
             continue
+        print(f"[rank {rank}] loss/grads NaN/Inf check passed", flush=True)
 
+        # 2) Grad scaling & accumulation
+        print(f"[rank {rank}] scaling and accumulating grads", flush=True)
         grads = tree_map(
             lambda g: g / accum_steps if isinstance(g, mx.array) else g,
             grads,
@@ -524,10 +526,21 @@ def train_hf_distributed(
         micro_accum += 1
 
         if micro_accum == accum_steps:
+            # 3) Allreduce grads
+            print(f"[rank {rank}] entering allreduce_grads at step {update_step}", flush=True)
             global_grads = allreduce_grads(accum_grads, world)
+            print(f"[rank {rank}] finished allreduce_grads at step {update_step}", flush=True)
+
+            # 4) Clip global grad norm
+            print(f"[rank {rank}] entering clip_global at step {update_step}", flush=True)
             clipped, gnorm = clip_global(global_grads, model.cfg.max_grad_norm)
+            print(f"[rank {rank}] finished clip_global at step {update_step} (grad_norm={gnorm})", flush=True)
+
+            # 5) Optimizer update
+            print(f"[rank {rank}] entering opt.update at step {update_step}", flush=True)
             opt.update(model, clipped)
             mx.eval(model.parameters(), opt.state)
+            print(f"[rank {rank}] finished opt.update at step {update_step}", flush=True)
 
             now = time.time()
             dt = now - last
