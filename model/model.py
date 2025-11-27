@@ -52,10 +52,10 @@ class SPMTokenizer:
         return self.sp.decode(core)
 
 # ------- global tokenizer (SPM only) -------
-TOK: SPMTokenizer
-VOCAB_SIZE: int
-PAD_ID_RUNTIME: int
-MASK_ID_FOR_LOSS: int
+TOK: SPMTokenizer | None = None
+VOCAB_SIZE: int = 0
+PAD_ID_RUNTIME: int = 0
+MASK_ID_FOR_LOSS: int = 0
 
 def set_tokenizer(spm_path: str):
     """Require an SPM model and initialize globals."""
