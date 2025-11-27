@@ -428,6 +428,8 @@ def train_hf_distributed(
         _broadcast_from_rank0(model, rank)
 
     opt = optim.AdamW(lr, weight_decay=wd)
+    base_lr = lr
+    decay_start = int(max_steps * 0.5)
 
     sample_iter = hf_text_iterator(dataset_name, dataset_config, split, text_field, world, rank, trust_remote_code)
 
@@ -520,6 +522,17 @@ def train_hf_distributed(
                 max_norm = 0.0
 
             clipped, gnorm = clip_global(global_grads, max_norm)
+
+            # ---- Cosine LR decay after decay_start ----
+            if update_step >= decay_start:
+                t = (update_step - decay_start) / max(1, max_steps - decay_start)
+                t = min(1.0, max(0.0, t))
+                factor = 0.5 * (1.0 + math.cos(math.pi * t))  # 1 -> 0
+                opt.learning_rate = base_lr * factor
+            else:
+                opt.learning_rate = base_lr
+            # -------------------------------------------
+
             opt.update(model, clipped)
 
             now = time.time()
@@ -567,18 +580,99 @@ def train_hf_distributed(
 # Generators (KV-cache aware)
 # ---------------------------
 
-def _sample_next_token(logits: mx.array, temperature: float = 1.0,
-                       top_k: int | None = None, top_p: float | None = None) -> int:
-    logits = logits / max(1e-5, temperature)
-    probs = mx.softmax(logits, axis=-1)
-    probs_np = probs[0].tolist()
-    if top_k is not None and top_k > 0 and top_k < len(probs_np):
-        idxs = sorted(range(len(probs_np)), key=lambda i: probs_np[i], reverse=True)
+from collections import Counter
+
+def _apply_repetition_penalty_np(
+    logits_np: np.ndarray,
+    generated_ids: List[int],
+    repetition_penalty: float,
+    penalty_window: Optional[int],
+) -> np.ndarray:
+    """
+    Apply a count-based repetition penalty directly to logits (numpy array).
+
+    - logits_np: shape (vocab_size,)
+    - generated_ids: list of token ids generated so far (including prompt)
+    - repetition_penalty > 1.0: stronger push away from repeats
+    - penalty_window: consider only the last N tokens (None = all)
+    """
+    if not generated_ids or repetition_penalty is None or repetition_penalty <= 1.0:
+        return logits_np
+
+    if penalty_window is not None:
+        window_ids = generated_ids[-penalty_window:]
+    else:
+        window_ids = generated_ids
+
+    counts = Counter(window_ids)
+    for tid, c in counts.items():
+        if 0 <= tid < logits_np.shape[0]:
+            # divide by penalty ** count to strongly discourage heavy repeats
+            logits_np[tid] /= (repetition_penalty ** c)
+
+    return logits_np
+
+def _greedy_with_repetition_penalty(
+    logits: mx.array,
+    generated_ids: List[int],
+    repetition_penalty: float = 1.8,
+    penalty_window: int = 32,
+) -> int:
+    """
+    Deterministic 'greedy' using a count-based repetition penalty in logit space.
+    """
+    logits_np = np.array(logits[0], dtype=np.float32)
+    logits_np = _apply_repetition_penalty_np(
+        logits_np,
+        generated_ids,
+        repetition_penalty=repetition_penalty,
+        penalty_window=penalty_window,
+    )
+    best_id = int(np.argmax(logits_np))
+    return best_id
+
+def _sample_next_token(
+    logits: mx.array,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    generated_ids: Optional[List[int]] = None,
+    repetition_penalty: float = 1.0,
+    penalty_window: Optional[int] = None,
+) -> int:
+    """
+    Sample a next token with optional top-k/top-p and count-based repetition penalty
+    applied in logit space.
+    """
+    # Convert logits to numpy
+    logits_np = np.array(logits[0], dtype=np.float32)
+
+    # Apply repetition penalty before softmax
+    logits_np = _apply_repetition_penalty_np(
+        logits_np,
+        generated_ids or [],
+        repetition_penalty=repetition_penalty,
+        penalty_window=penalty_window,
+    )
+
+    # Temperature scaling + softmax
+    logits_np = logits_np / max(1e-5, float(temperature))
+    exp = np.exp(logits_np - np.max(logits_np))
+    probs_np = exp / (exp.sum() + 1e-9)
+
+    # ---- top-k filtering ----
+    if top_k is not None and top_k > 0 and top_k < probs_np.shape[0]:
+        idxs = np.argsort(probs_np)[::-1]
         keep = set(idxs[:top_k])
-        total = sum(probs_np[i] for i in keep)
-        probs_np = [p / total if i in keep else 0.0 for i, p in enumerate(probs_np)]
+        mask = np.array([1.0 if i in keep else 0.0 for i in range(len(probs_np))], dtype=np.float32)
+        probs_np *= mask
+        total = probs_np.sum()
+        if total > 0:
+            probs_np /= total
+
+    # ---- top-p (nucleus) filtering ----
     if top_p is not None and 0.0 < top_p < 1.0:
-        idxs = sorted(range(len(probs_np)), key=lambda i: probs_np[i], reverse=True)
+        idxs = np.argsort(probs_np)[::-1]
         cumulative = 0.0
         keep = []
         for i in idxs:
@@ -586,17 +680,24 @@ def _sample_next_token(logits: mx.array, temperature: float = 1.0,
             keep.append(i)
             if cumulative >= top_p:
                 break
-        keep = set(keep)
-        total = sum(probs_np[i] for i in keep)
-        probs_np = [p / total if i in keep else 0.0 for i, p in enumerate(probs_np)]
+        keep_set = set(keep)
+        mask = np.array([1.0 if i in keep_set else 0.0 for i in range(len(probs_np))], dtype=np.float32)
+        probs_np *= mask
+        total = probs_np.sum()
+        if total > 0:
+            probs_np /= total
+
+    # ---- sample from adjusted distribution ----
     import random
     r = random.random()
     c = 0.0
     for i, p in enumerate(probs_np):
         c += p
         if r <= c:
-            return i
-    return int(mx.argmax(probs, axis=-1).item())
+            return int(i)
+
+    # Fallback: argmax
+    return int(np.argmax(probs_np))
 
 def generate_greedy_nocache(model: TinyGPLM, prompt: str, max_new_tokens: int = 128) -> str:
     ids = TOK.encode(prompt)[: model.cfg.max_seq]
@@ -605,7 +706,14 @@ def generate_greedy_nocache(model: TinyGPLM, prompt: str, max_new_tokens: int = 
         x_ids = mx.array([out_ids[:model.cfg.max_seq]], dtype=mx.int32)  # shape (1, T)
         logits = model.logits(x_ids)  # (1, T, vocab)
         last_logits = logits[:, -1, :]  # (1, vocab)
-        next_id = int(mx.argmax(last_logits, axis=-1).item())
+
+        next_id = _greedy_with_repetition_penalty(
+            last_logits,
+            generated_ids=out_ids,
+            repetition_penalty=1.8,   # strong push away from repeats
+            penalty_window=32,        # only care about recent tokens
+        )
+
         out_ids.append(next_id)
         if next_id == TOK.eos_id:
             break
@@ -622,7 +730,15 @@ def generate_topk(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
     out_ids = ids[:]
     for _ in range(max_new_tokens):
         logits, caches = model.step(cur, caches)
-        next_id = _sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=None)
+        next_id = _sample_next_token(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=None,
+            generated_ids=out_ids,
+            repetition_penalty=1.5,   # milder than greedy
+            penalty_window=64,
+        )
         out_ids.append(int(next_id))
         if next_id == TOK.eos_id:
             break
@@ -640,7 +756,15 @@ def generate_topp(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
     out_ids = ids[:]
     for _ in range(max_new_tokens):
         logits, caches = model.step(cur, caches)
-        next_id = _sample_next_token(logits, temperature=temperature, top_k=None, top_p=top_p)
+        next_id = _sample_next_token(
+            logits,
+            temperature=temperature,
+            top_k=None,
+            top_p=top_p,
+            generated_ids=out_ids,
+            repetition_penalty=1.5,
+            penalty_window=64,
+        )
         out_ids.append(int(next_id))
         if next_id == TOK.eos_id:
             break
@@ -652,7 +776,6 @@ def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: in
     Run multiple evaluation prompts with several decoding strategies
     so you can see different behaviors as training progresses.
     """
-    # Primary eval prompt (from CLI)
     prompts = [
         ("default", prompt),
         ("story", "Once upon a time, "),
@@ -665,7 +788,7 @@ def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: in
         print(f"[{step}] === EVAL SAMPLES ({label}) ===")
         print(f"Prompt: {repr(p)}")
 
-        # 1) Pure greedy
+        # 1) Greedy with repetition penalty
         greedy_nocache = generate_greedy_nocache(model, p, max_new_tokens)
         print(f"[{step}] [{label}] greedy (no cache):\n{greedy_nocache}\n---")
 
@@ -737,7 +860,7 @@ def main():
     p.add_argument("--save-every", type=int, default=5000)
     p.add_argument("--eval-every", type=int, default=0)
     p.add_argument("--eval-prompt", type=str, default="Hello, my name is ")
-    p.add_argument("--eval-tokens", type=int, default=50)
+    p.add_argument("--eval-tokens", type=int, default=200)
     p.add_argument("--resume", type=str, default=None, help="Path to a .safetensors checkpoint to resume from")
 
     p.add_argument("--spm-model", type=str, required=True,
