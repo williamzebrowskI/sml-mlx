@@ -483,15 +483,10 @@ def train_hf_distributed(
         if X is None:
             break
 
-        print(f"[rank {rank}] got batch X.shape={tuple(X.shape)}, Y.shape={tuple(Y.shape)}", flush=True)
-
         loss, grads = step(X, Y)
-        print(f"[rank {rank}] step() returned loss={float(loss.item())} (before mx.eval)", flush=True)
         mx.eval(loss, grads)
-        print(f"[rank {rank}] finished mx.eval(loss, grads)", flush=True)
 
         # 1) NaN/Inf checks
-        print(f"[rank {rank}] checking loss/grads for NaN/Inf", flush=True)
         if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
             if rank == 0:
                 print(f"[{update_step}] ⚠️ NaN/Inf loss; skipping micro-step", flush=True)
@@ -503,10 +498,8 @@ def train_hf_distributed(
             if rank == 0:
                 print(f"[{update_step}] ⚠️ NaN/Inf grads; skipping micro-step", flush=True)
             continue
-        print(f"[rank {rank}] loss/grads NaN/Inf check passed", flush=True)
 
         # 2) Grad scaling & accumulation
-        print(f"[rank {rank}] scaling and accumulating grads", flush=True)
         grads = tree_map(
             lambda g: g / accum_steps if isinstance(g, mx.array) else g,
             grads,
@@ -655,52 +648,66 @@ def generate_topp(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
     return TOK.decode(out_ids)
 
 def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: int):
-    print(f"[{step}] === EVAL SAMPLES ===")
-    print(f"Prompt: {repr(prompt)}")
+    """
+    Run multiple evaluation prompts with several decoding strategies
+    so you can see different behaviors as training progresses.
+    """
+    # Primary eval prompt (from CLI)
+    prompts = [
+        ("default", prompt),
+        ("story", "Once upon a time, "),
+        ("facts", "The capital of France is "),
+        ("code", "Write a Python function that "),
+        ("reasoning", "If Alice has 3 apples and Bob gives her 2 more, "),
+    ]
 
-    # 1) Pure greedy
-    greedy_nocache = generate_greedy_nocache(model, prompt, max_new_tokens)
-    print(f"[{step}] greedy (no cache):\n{greedy_nocache}\n---")
+    for label, p in prompts:
+        print(f"[{step}] === EVAL SAMPLES ({label}) ===")
+        print(f"Prompt: {repr(p)}")
 
-    # 2) Top-k, fairly conservative
-    topk_20_t07 = generate_topk(
-        model,
-        prompt,
-        max_new_tokens,
-        temperature=0.7,
-        top_k=20,
-    )
-    print(f"[{step}] top-k (k=20, T=0.7):\n{topk_20_t07}\n---")
+        # 1) Pure greedy
+        greedy_nocache = generate_greedy_nocache(model, p, max_new_tokens)
+        print(f"[{step}] [{label}] greedy (no cache):\n{greedy_nocache}\n---")
 
-    # 3) Top-k, more exploratory
-    topk_80_t10 = generate_topk(
-        model,
-        prompt,
-        max_new_tokens,
-        temperature=1.0,
-        top_k=80,
-    )
-    print(f"[{step}] top-k (k=80, T=1.0):\n{topk_80_t10}\n---")
+        # 2) Top-k, fairly conservative
+        topk_20_t07 = generate_topk(
+            model,
+            p,
+            max_new_tokens,
+            temperature=0.7,
+            top_k=20,
+        )
+        print(f"[{step}] [{label}] top-k (k=20, T=0.7):\n{topk_20_t07}\n---")
 
-    # 4) Top-p (nucleus), conservative
-    topp_09_t07 = generate_topp(
-        model,
-        prompt,
-        max_new_tokens,
-        temperature=0.7,
-        top_p=0.9,
-    )
-    print(f"[{step}] top-p (p=0.9, T=0.7):\n{topp_09_t07}\n---")
+        # 3) Top-k, more exploratory
+        topk_80_t10 = generate_topk(
+            model,
+            p,
+            max_new_tokens,
+            temperature=1.0,
+            top_k=80,
+        )
+        print(f"[{step}] [{label}] top-k (k=80, T=1.0):\n{topk_80_t10}\n---")
 
-    # 5) Top-p, more exploratory
-    topp_095_t10 = generate_topp(
-        model,
-        prompt,
-        max_new_tokens,
-        temperature=1.0,
-        top_p=0.95,
-    )
-    print(f"[{step}] top-p (p=0.95, T=1.0):\n{topp_095_t10}\n---")
+        # 4) Top-p (nucleus), conservative
+        topp_09_t07 = generate_topp(
+            model,
+            p,
+            max_new_tokens,
+            temperature=0.7,
+            top_p=0.9,
+        )
+        print(f"[{step}] [{label}] top-p (p=0.9, T=0.7):\n{topp_09_t07}\n---")
+
+        # 5) Top-p, more exploratory
+        topp_095_t10 = generate_topp(
+            model,
+            p,
+            max_new_tokens,
+            temperature=1.0,
+            top_p=0.95,
+        )
+        print(f"[{step}] [{label}] top-p (p=0.95, T=1.0):\n{topp_095_t10}\n---")
 
 # ---------------------------
 # CLI
