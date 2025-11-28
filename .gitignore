@@ -25,6 +25,7 @@ data/qa_prompt_completion
 model/checkpoints/
 model/checkpoints_owt/
 model/checkpoints_spm/
+model/checkpoints_smolsmoltalk_sft/
 model/lora_adapters
 runs/sml-lm/*.safetensors
 runs/sml-lm-100m/*.safetensors

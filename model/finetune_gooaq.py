@@ -1,19 +1,23 @@
 #!/usr/bin/env python
 """
-Fine-tune TinyGPLM on Smol-SmolTalk (short user/assistant conversations) using MLX.
+Fine-tune TinyGPLM on GooAQ Q/A pairs using MLX, in User/Assistant chat format.
 
-Dataset: HuggingFaceTB/smol-smoltalk
+Intended as a SECOND SFT STAGE after Smol-SmolTalk, e.g.:
+
+    Base pretrain   : FineWeb -> ckpt_1000000.safetensors
+    Chat SFT        : Smol-SmolTalk -> smolsmoltalk_sft_005000.safetensors
+    GooAQ QA SFT    : this script, starting from smolsmoltalk_sft_005000
 
 Usage example (single Mac):
 
-PYTHONPATH=. python -m model.fine_tune \
-  --ckpt model/checkpoints_spm/ckpt_1000000.safetensors \
+PYTHONPATH=. python -m model.finetune_gooaq \
+  --ckpt model/checkpoints_smolsmoltalk_sft/smolsmoltalk_sft_005000.safetensors \
   --spm-model tokenizer/fineweb_spm/spm.model \
-  --max-steps 50000 \
-  --seq-len 2048 \
+  --max-steps 5000 \
+  --seq-len 3072 \
   --batch-size 1 \
-  --lr 5e-5 \
-  --save-dir model/checkpoints_smolsmoltalk_sft
+  --lr 1e-5 \
+  --save-dir model/checkpoints_gooaq_sft
 """
 
 import argparse
@@ -41,56 +45,58 @@ load_safetensors_model = mdl.load_safetensors_model
 save_safetensors_model = mdl.save_safetensors_model
 
 
-# ---------- Smol-SmolTalk streaming iterator ----------
+# ---------- GooAQ streaming iterator ----------
 
-def smol_smoltalk_text_iterator(split: str = "train"):
+def _is_bad_answer(a: str) -> bool:
     """
-    Stream Smol-SmolTalk conversations and yield {"text": "..."} entries.
+    Very simple filter to skip obviously 'array-like' answers, which are
+    literal string representations of Python lists in some GooAQ rows.
+    """
+    if not a:
+        return True
+    s = a.strip()
+    # Skip answers that look like "['foo', 'bar']"
+    if s.startswith("[") and s.endswith("]"):
+        return True
+    return False
 
-    Dataset: HuggingFaceTB/smol-smoltalk
 
-    Each row has:
-      - messages: list of { "content": str, "role": str }
-      - source: str
+def gooaq_text_iterator(split: str = "train"):
+    """
+    Stream GooAQ Q/A pairs from Hugging Face and yield {"text": "..."} entries.
 
-    We flatten each conversation into a User/Assistant chat transcript like:
+    Dataset: allenai/gooaq
 
-      User: ...
-      Assistant: ...
-      User: ...
-      Assistant: ...
+    Fields (from the dataset card):
+      - question: str
+      - answer: str (may be None or an array-like string)
+
+    We convert each example into a User/Assistant transcript:
+
+      User: {question}
+      Assistant: {answer}
 
     and train the LM on that text with next-token prediction.
     """
-    ds = load_dataset("HuggingFaceTB/smol-smoltalk", split=split, streaming=True)
+    ds = load_dataset(
+        "allenai/gooaq",
+        split=split,
+        streaming=True,
+        trust_remote_code=True,  # avoid interactive prompt
+    )
 
     for ex in ds:
-        messages = ex.get("messages", None)
-        if not messages or not isinstance(messages, list):
+        q = ex.get("question", None)
+        a = ex.get("answer", None)
+
+        if not q or not a:
             continue
 
-        lines = []
-        for turn in messages:
-            role = turn.get("role", "")
-            content = turn.get("content", "")
-            if not content:
-                continue
-
-            role_l = role.lower()
-            if role_l == "user":
-                prefix = "User"
-            elif role_l == "assistant":
-                prefix = "Assistant"
-            else:
-                # Unknown role; treat as user by default
-                prefix = "User"
-
-            lines.append(f"{prefix}: {content}")
-
-        if not lines:
+        # Basic filter for bad / array-like answers
+        if _is_bad_answer(a):
             continue
 
-        text = "\n".join(lines)
+        text = f"User: {q}\nAssistant: {a}"
         yield {"text": text}
 
 
@@ -139,7 +145,7 @@ def make_batch_iterator(sample_iter, seq_len: int, batch_size: int):
 
 # ---------- Fine-tune loop ----------
 
-def finetune_smol_smoltalk(
+def finetune_gooaq(
     ckpt_path: str,
     spm_model: str,
     max_steps: int,
@@ -167,16 +173,16 @@ def finetune_smol_smoltalk(
     )
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
-    print(f"[ft] model initialized (vocab={vocab_size}, d_model={cfg.d_model}, layers={cfg.n_layers})")
+    print(f"[ft-gooaq] model initialized (vocab={vocab_size}, d_model={cfg.d_model}, layers={cfg.n_layers})")
 
-    # 3. Load base checkpoint
+    # 3. Load base checkpoint (ideally a Smol-SmolTalk SFT checkpoint)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     ok = load_safetensors_model(ckpt_path, model)
     if not ok:
         raise RuntimeError(f"Failed to load checkpoint: {ckpt_path}")
     mx.eval(model.parameters())
-    print(f"[ft] loaded base checkpoint from {ckpt_path}")
+    print(f"[ft-gooaq] loaded base checkpoint from {ckpt_path}")
 
     # 4. Optimizer
     opt = optim.AdamW(lr, weight_decay=wd)
@@ -188,7 +194,7 @@ def finetune_smol_smoltalk(
     step_fn = nn.value_and_grad(model, loss_fn)
 
     # 6. Data pipeline
-    sample_iter = smol_smoltalk_text_iterator(split=split)
+    sample_iter = gooaq_text_iterator(split=split)
     batch_iter = make_batch_iterator(sample_iter, seq_len=seq_len, batch_size=batch_size)
 
     update_step = 0
@@ -223,7 +229,7 @@ def finetune_smol_smoltalk(
         # Periodic checkpoint
         if update_step > 0 and save_every > 0 and update_step % save_every == 0:
             os.makedirs(save_dir, exist_ok=True)
-            out_path = os.path.join(save_dir, f"smolsmoltalk_sft_{update_step:06d}.safetensors")
+            out_path = os.path.join(save_dir, f"gooaq_sft_{update_step:06d}.safetensors")
             ok = save_safetensors_model(out_path, model)
             if ok:
                 print(f"[{update_step}] saved fine-tuned checkpoint to {out_path}")
@@ -232,35 +238,35 @@ def finetune_smol_smoltalk(
 
     # Final checkpoint
     os.makedirs(save_dir, exist_ok=True)
-    final_path = os.path.join(save_dir, "smolsmoltalk_sft_final.safetensors")
+    final_path = os.path.join(save_dir, "gooaq_sft_final.safetensors")
     ok = save_safetensors_model(final_path, model)
     if ok:
-        print(f"[ft] saved final fine-tuned checkpoint to {final_path}")
+        print(f"[ft-gooaq] saved final fine-tuned checkpoint to {final_path}")
     else:
-        print(f"[ft] ⚠️ failed to save final checkpoint to {final_path}")
+        print(f"[ft-gooaq] ⚠️ failed to save final checkpoint to {final_path}")
 
 
 # ---------- CLI ----------
 
 def main():
-    p = argparse.ArgumentParser("Fine-tune TinyGPLM on Smol-SmolTalk with MLX")
-    p.add_argument("--ckpt", type=str, required=True, help="Base .safetensors checkpoint to fine-tune")
+    p = argparse.ArgumentParser("Fine-tune TinyGPLM on GooAQ (User/Assistant QA) with MLX")
+    p.add_argument("--ckpt", type=str, required=True, help="Base .safetensors checkpoint to fine-tune (e.g. Smol-SmolTalk SFT)")
     p.add_argument("--spm-model", type=str, required=True, help="Path to SentencePiece model (spm.model)")
 
-    p.add_argument("--max-steps", type=int, default=50_000, help="Number of update steps for SFT")
+    p.add_argument("--max-steps", type=int, default=5000, help="Number of update steps for GooAQ SFT")
     p.add_argument("--seq-len", type=int, default=3072, help="Sequence length for fine-tuning")
     p.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    p.add_argument("--lr", type=float, default=5e-5, help="Learning rate for AdamW")
+    p.add_argument("--lr", type=float, default=1e-5, help="Learning rate for AdamW")
     p.add_argument("--wd", type=float, default=0.01, help="Weight decay for AdamW")
 
     p.add_argument("--log-every", type=int, default=50, help="Log every N steps")
-    p.add_argument("--save-dir", type=str, default="model/checkpoints_smolsmoltalk_sft", help="Where to store SFT checkpoints")
-    p.add_argument("--save-every", type=int, default=5000, help="Save checkpoint every N steps (0 = only final)")
-    p.add_argument("--split", type=str, default="train", help="Which Smol-SmolTalk split to use (train/test)")
+    p.add_argument("--save-dir", type=str, default="model/checkpoints_gooaq_sft", help="Where to store GooAQ SFT checkpoints")
+    p.add_argument("--save-every", type=int, default=1000, help="Save checkpoint every N steps (0 = only final)")
+    p.add_argument("--split", type=str, default="train", help="Which GooAQ split to use (train/validation/test)")
 
     args = p.parse_args()
 
-    finetune_smol_smoltalk(
+    finetune_gooaq(
         ckpt_path=args.ckpt,
         spm_model=args.spm_model,
         max_steps=args.max_steps,
