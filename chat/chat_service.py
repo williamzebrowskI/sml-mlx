@@ -24,6 +24,7 @@ import importlib
 import io
 import os
 import contextlib
+import json
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -46,10 +47,11 @@ set_tokenizer = mdl.set_tokenizer
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CKPT = os.getenv(
     "CHAT_CKPT_PATH",
-    str(ROOT / "model" / "checkpoints_smolsmoltalk_sft" / "smolsmoltalk_sft_125000.safetensors"),
+    str(ROOT / "model" / "checkpoints_smolsmoltalk_sft" / "smolsmoltalk_sft_005000.safetensors"),
 )
 DEFAULT_SPM = os.getenv("CHAT_SPM_MODEL", str(ROOT / "tokenizer" / "fineweb_spm" / "spm.model"))
 DEFAULT_SEQ_LEN = int(os.getenv("CHAT_SEQ_LEN", "2048"))
+DEFAULT_CONFIG = os.getenv("CHAT_CONFIG", None)
 
 
 class GenerateRequest(BaseModel):
@@ -63,6 +65,7 @@ def run_finetune_eval_greedy(
     seq_len: int,
     max_new_tokens: int,
     prompt: str,
+    config_path: str | None = None,
 ) -> str:
     """
     Invoke model.finetune_eval.eval_checkpoint (unchanged) and capture the greedy block.
@@ -75,6 +78,7 @@ def run_finetune_eval_greedy(
             seq_len=seq_len,
             max_new_tokens=max_new_tokens,
             prompt=prompt,
+            config_path=config_path,
         )
     out = buf.getvalue()
     if "[greedy]" not in out:
@@ -102,7 +106,12 @@ def _extract_assistant_only(full_text: str, prompt: str) -> str:
     return reply.strip()
 
 
-def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_len: int = DEFAULT_SEQ_LEN) -> FastAPI:
+def build_app(
+    ckpt_path: str = DEFAULT_CKPT,
+    spm_model: str = DEFAULT_SPM,
+    seq_len: int = DEFAULT_SEQ_LEN,
+    config_path: str | None = DEFAULT_CONFIG,
+) -> FastAPI:
     app = FastAPI(title="SmolSmolTalk Chat Service", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -115,6 +124,7 @@ def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_l
     app.state.ckpt_path = ckpt_path
     app.state.spm_model = spm_model
     app.state.seq_len = seq_len
+    app.state.config_path = config_path
 
     web_dir = Path(__file__).parent
     if web_dir.exists():
@@ -144,6 +154,7 @@ def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_l
             "ckpt": app.state.ckpt_path,
             "spm_model": app.state.spm_model,
             "max_seq": app.state.seq_len,
+            "config": app.state.config_path,
         }
 
     @app.post("/generate")
@@ -157,6 +168,7 @@ def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_l
             app.state.seq_len,
             body.max_new_tokens,
             body.prompt,
+            app.state.config_path,
         )
         return JSONResponse(
             {
@@ -169,8 +181,6 @@ def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_l
     @app.websocket("/ws")
     async def websocket_chat(ws: WebSocket):
         await ws.accept()
-        history: list[Dict[str, str]] = []
-
         while True:
             try:
                 init = await ws.receive_json()
@@ -185,7 +195,6 @@ def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_l
                 await ws.send_json({"type": "error", "message": "Message cannot be empty"})
                 continue
 
-            history.append({"role": "user", "content": message})
             max_new_tokens = int(init.get("max_new_tokens", 200))
 
             await ws.send_json(
@@ -197,13 +206,13 @@ def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_l
             )
 
             try:
-                # Build prompt from history for this turn
-                lines = []
-                for m in history:
-                    prefix = "Assistant" if m["role"] == "assistant" else "User"
-                    lines.append(f"{prefix}: {m['content']}")
-                lines.append("Assistant: ")
-                prompt = "\n".join(lines)
+                # Single-turn prompt (no history); append Assistant: if user didn't
+                prompt = message.rstrip()
+                if not prompt.endswith("Assistant:"):
+                    if prompt.endswith("\n"):
+                        prompt = prompt + "Assistant: "
+                    else:
+                        prompt = prompt + "\nAssistant: "
 
                 loop = asyncio.get_event_loop()
                 text = await loop.run_in_executor(
@@ -214,11 +223,11 @@ def build_app(ckpt_path: str = DEFAULT_CKPT, spm_model: str = DEFAULT_SPM, seq_l
                     app.state.seq_len,
                     max_new_tokens,
                     prompt,
+                    app.state.config_path,
                 )
                 clean = _extract_assistant_only(text, prompt)
                 if not clean:
                     clean = text.strip()
-                history.append({"role": "assistant", "content": clean})
                 await ws.send_json({"type": "token", "text": clean, "done": True})
             except WebSocketDisconnect:
                 return
@@ -240,6 +249,7 @@ def parse_args():
     p.add_argument("--ckpt", type=str, default=DEFAULT_CKPT, help="Path to .safetensors checkpoint")
     p.add_argument("--spm-model", type=str, default=DEFAULT_SPM, help="Path to SentencePiece model")
     p.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN, help="Max sequence length")
+    p.add_argument("--config", type=str, default=DEFAULT_CONFIG, help="Optional path to JSON config")
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     return p.parse_args()
@@ -247,5 +257,5 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    app = build_app(args.ckpt, args.spm_model, args.seq_len)
+    app = build_app(args.ckpt, args.spm_model, args.seq_len, args.config)
     uvicorn.run(app, host=args.host, port=args.port)

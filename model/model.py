@@ -1,5 +1,6 @@
+#!/usr/bin/env python
 # model/model.py
-# A ~25M-parameter LM in MLX with HF streaming + ring DDP,
+# A ~100M-parameter LM in MLX with HF streaming + ring DDP,
 # using a SentencePiece BPE tokenizer ONLY (no byte-tokenizer fallback).
 # Upgrades:
 # - RMSNorm + SiLU + RoPE
@@ -78,7 +79,7 @@ def make_rope(head_dim: int, base: float = 10000.0):
 # ---------------------------
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, max_seq: int):
+    def __init__(self, d_model: int, n_heads: int, max_seq: int, rope_base: float = 10000.0):
         super().__init__()
         assert d_model % n_heads == 0
         self.h  = n_heads
@@ -87,7 +88,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model,    bias=False)
         self.max_seq = max_seq
         self._mask = nn.MultiHeadAttention.create_additive_causal_mask(max_seq)
-        self.rope = make_rope(self.dh, base=10000.0)
+        self.rope = make_rope(self.dh, base=rope_base)
 
     def __call__(self, x: mx.array, cache: Optional[Tuple[mx.array, mx.array]] = None) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
         B, T, D = x.shape
@@ -120,10 +121,17 @@ class CausalSelfAttention(nn.Module):
         return out, (k, v)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, max_seq: int, mlp_mult=4):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        max_seq: int,
+        mlp_mult: int = 4,
+        rope_base: float = 10000.0,
+    ):
         super().__init__()
         self.ln1  = nn.RMSNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, max_seq)
+        self.attn = CausalSelfAttention(d_model, n_heads, max_seq, rope_base=rope_base)
         self.ln2  = nn.RMSNorm(d_model)
         self.ffn  = nn.Sequential(
             nn.Linear(d_model, mlp_mult * d_model, bias=False),
@@ -140,18 +148,47 @@ class TransformerBlock(nn.Module):
 @dataclass
 class TinyGPConfig:
     vocab_size: int
-    d_model: int = 384
-    n_heads: int = 6
-    n_layers: int = 12
+    d_model: int = 768        # 100M config: 768-dim model
+    n_heads: int = 12         # 12 heads → 64-dim per head
+    n_layers: int = 12        # 12 transformer blocks
     max_seq: int = 256
     max_grad_norm: float = 1.0
+    mlp_mult: int = 4
+    rope_base: float = 10000.0
+
+def load_tinygplm_config(path: str, vocab_size: int, max_seq: int) -> TinyGPConfig:
+    """
+    Load a TinyGPLM config from a JSON file and merge with runtime vocab_size/max_seq.
+    """
+    with open(path, "r") as f:
+        cfg_json = json.load(f)
+
+    return TinyGPConfig(
+        vocab_size=vocab_size,
+        d_model=cfg_json.get("d_model", 768),
+        n_heads=cfg_json.get("n_heads", 12),
+        n_layers=cfg_json.get("n_layers", 12),
+        max_seq=max_seq,
+        max_grad_norm=1.0,
+        mlp_mult=cfg_json.get("mlp_mult", 4),
+        rope_base=cfg_json.get("rope_base", 10000.0),
+    )
 
 class TinyGPLM(nn.Module):
     def __init__(self, cfg: TinyGPConfig):
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.blocks  = [TransformerBlock(cfg.d_model, cfg.n_heads, cfg.max_seq) for _ in range(cfg.n_layers)]
+        self.blocks  = [
+            TransformerBlock(
+                cfg.d_model,
+                cfg.n_heads,
+                cfg.max_seq,
+                mlp_mult=cfg.mlp_mult,
+                rope_base=cfg.rope_base,
+            )
+            for _ in range(cfg.n_layers)
+        ]
         self.ln_f    = nn.RMSNorm(cfg.d_model)
         self.out_bias = mx.zeros((cfg.vocab_size,))
         self.pos_cache = None  # RoPE handles positions
@@ -213,8 +250,8 @@ def hf_text_iterator(name, config, split, field, world_size, rank, trust_remote_
 
 def init_dist(backend="ring", expected_world=None):
     group = mx.distributed.init(backend=backend)
-    size = group.size() if callable(getattr(group, "size", None)) else int(getattr(group, "size", 1))
-    rank = group.rank() if callable(getattr(group, "rank", None)) else int(getattr(group, "rank", 0))
+    size = group.size() if callable(getattr(group,"size",None)) else int(getattr(group,"size",1))
+    rank = group.rank() if callable(getattr(group,"rank",None)) else int(getattr(group,"rank",0))
     print(f"[boot] rank={rank} size={size} backend={backend}", flush=True)
     if expected_world is not None and size != expected_world:
         raise RuntimeError(f"Expected world size {expected_world}, got {size}")
@@ -391,6 +428,8 @@ def train_hf_distributed(
     eval_prompt: str = "Hello, my name is ",
     eval_tokens: int = 50,
     resume_ckpt: Optional[str] = None,
+    config_path: Optional[str] = None,
+    lr_decay_start_step: Optional[int] = None,
 ):
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
     print(f"[rank {rank}] entering train_hf_distributed", flush=True)
@@ -402,8 +441,19 @@ def train_hf_distributed(
         local_seq_len = seq_len
     print(f"[rank {rank}] using local_seq_len={local_seq_len} (global seq_len={seq_len})", flush=True)
 
-    cfg = TinyGPConfig(vocab_size=VOCAB_SIZE, d_model=384, n_heads=6, n_layers=12,
-                       max_seq=seq_len, max_grad_norm=1.0)
+    # Build config from JSON (if provided) or use defaults
+    if config_path is not None:
+        cfg = load_tinygplm_config(config_path, vocab_size=VOCAB_SIZE, max_seq=seq_len)
+    else:
+        cfg = TinyGPConfig(
+            vocab_size=VOCAB_SIZE,
+            d_model=768,
+            n_heads=12,
+            n_layers=12,
+            max_seq=seq_len,
+            max_grad_norm=1.0,
+        )
+
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
     print(f"[rank {rank}] model initialized (vocab={VOCAB_SIZE}, d_model={cfg.d_model}, layers={cfg.n_layers})", flush=True)
@@ -427,9 +477,24 @@ def train_hf_distributed(
         print(f"[rank {rank}] broadcasting parameters from rank 0", flush=True)
         _broadcast_from_rank0(model, rank)
 
+    # Approximate number of dataset examples to skip when resuming.
+    # For world=1 and batch_size=1, each step uses exactly one example.
+    skip_examples = update_step * batch_size if resume_ckpt else 0
+    if rank == 0 and skip_examples > 0:
+        print(
+            f"[rank 0] will skip approximately {skip_examples} examples in the data stream "
+            f"to align with resume step {update_step}",
+            flush=True,
+        )
+
     opt = optim.AdamW(lr, weight_decay=wd)
     base_lr = lr
-    decay_start = int(max_steps * 0.5)
+
+    # Decide when to start LR decay
+    if lr_decay_start_step is not None:
+        decay_start = lr_decay_start_step
+    else:
+        decay_start = int(max_steps * 0.5)
 
     sample_iter = hf_text_iterator(dataset_name, dataset_config, split, text_field, world, rank, trust_remote_code)
 
@@ -437,7 +502,14 @@ def train_hf_distributed(
         X = mx.zeros((batch_size, local_seq_len), dtype=mx.int32)
         Y = mx.zeros((batch_size, local_seq_len), dtype=mx.int32)
         filled = 0
+        skipped = 0
+
         for ex in sample_iter:
+            # Skip examples if resuming, before building batches
+            if skipped < skip_examples:
+                skipped += 1
+                continue
+
             text = ex.get("text", "")
             if not text:
                 continue
@@ -542,7 +614,7 @@ def train_hf_distributed(
                 toks_local_s = (batch_size * local_seq_len * accum_steps) / max(1e-9, dt)
                 ppl = math.exp(min(20.0, float(loss.item())))
                 lr_cur = getattr(opt, "learning_rate", None)
-                lr_str = f" lr={lr_cur:.2e}" if lr_cur is not None else ""
+                lr_str = f" lr={lr_cur:.6e}" if lr_cur is not None else ""
                 if per_rank_logs:
                     print(f"[{update_step}] rank={rank} loss={loss.item():.4f} "
                           f"ppl={ppl:.2f} grad_norm={gnorm:.3f}{lr_str} "
@@ -866,14 +938,28 @@ def main():
     p.add_argument("--spm-model", type=str, required=True,
                    help="Path to tokenizer/fineweb_spm/spm.model")
 
+    p.add_argument(
+        "--config",
+        type=str,
+        default="configs/config_mlx_slm_beta_v2_100m.json",
+        help="Path to TinyGPLM JSON model config.",
+    )
+
+    p.add_argument(
+        "--lr-decay-start-step",
+        type=int,
+        default=None,
+        help="Step at which to start cosine LR decay (default: 0.5 * max_steps).",
+    )
+
     args = p.parse_args()
 
     set_tokenizer(args.spm_model)
 
-    cfg = None if args.dataset_config in (None, "", "None", "none") else args.dataset_config
+    ds_cfg = None if args.dataset_config in (None, "", "None", "none") else args.dataset_config
     train_hf_distributed(
         dataset_name=args.dataset,
-        dataset_config=cfg,
+        dataset_config=ds_cfg,
         split=args.split,
         text_field=args.text_field,
         trust_remote_code=args.trust_remote_code,
@@ -893,6 +979,8 @@ def main():
         eval_prompt=args.eval_prompt,
         eval_tokens=args.eval_tokens,
         resume_ckpt=args.resume,
+        config_path=args.config,
+        lr_decay_start_step=args.lr_decay_start_step,
     )
 
 if __name__ == "__main__":
