@@ -8,13 +8,17 @@
 # - KV-cache for fast inference
 # - safetensors save/load + resume with rank-0 broadcast
 # - Runtime PAD/MASK ids follow the active SPM tokenizer
+#
+# NEW (per your request):
+# - Fixed evaluation set (rank 0): mean eval loss/ppl every N steps
+# - EMA (moving average) of training loss printed in logs
 
 import os
 os.environ.setdefault("MX_MAX_INFLIGHT_CMDS", "1")
 
 import math, time, json, gzip, requests, argparse, threading, queue
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any, Dict
 
 import numpy as np
 from safetensors.numpy import load_file as safetensors_load  # loading .safetensors
@@ -48,6 +52,18 @@ class SPMTokenizer:
         ids += [self.eos_id]
         return ids
 
+    def encode_prompt(self, s: str) -> List[int]:
+        """
+        Encode a prompt for inference.
+
+        Important: unlike `encode()`, this does NOT append EOS.
+        Appending EOS to prompts makes generation start *after* an end-of-sequence token,
+        which often causes degenerate outputs (e.g., immediate stop or punctuation).
+        """
+        ids = [self.bos_id]
+        ids += self.sp.encode(s, out_type=int)
+        return ids
+
     def decode(self, ids: List[int]) -> str:
         core = [t for t in ids if t not in (self.pad_id, self.bos_id, self.eos_id)]
         return self.sp.decode(core)
@@ -66,6 +82,14 @@ def set_tokenizer(spm_path: str):
     PAD_ID_RUNTIME = TOK.pad_id
     MASK_ID_FOR_LOSS = PAD_ID_RUNTIME
     print(f"[tok] Using SentencePiece BPE: {spm_path} (vocab={VOCAB_SIZE}, pad_id={PAD_ID_RUNTIME})", flush=True)
+
+def encode_prompt(prompt: str) -> List[int]:
+    """
+    Convenience wrapper for inference-time prompt encoding (BOS + tokens, no EOS).
+    """
+    if TOK is None:
+        raise RuntimeError("Tokenizer not initialized. Call set_tokenizer() first.")
+    return TOK.encode_prompt(prompt)
 
 # ---------------------------
 # RoPE helper (per-head dim)
@@ -148,9 +172,9 @@ class TransformerBlock(nn.Module):
 @dataclass
 class TinyGPConfig:
     vocab_size: int
-    d_model: int = 768        # 100M config: 768-dim model
-    n_heads: int = 12         # 12 heads → 64-dim per head
-    n_layers: int = 12        # 12 transformer blocks
+    d_model: int = 768
+    n_heads: int = 12
+    n_layers: int = 12
     max_seq: int = 256
     max_grad_norm: float = 1.0
     mlp_mult: int = 4
@@ -194,7 +218,6 @@ class TinyGPLM(nn.Module):
         self.pos_cache = None  # RoPE handles positions
 
     def logits(self, x_ids: mx.array) -> mx.array:
-        B, T = x_ids.shape
         x = self.tok_emb(x_ids)
         for blk in self.blocks:
             x, _ = blk(x, cache=None)
@@ -244,6 +267,32 @@ def hf_text_iterator(name, config, split, field, world_size, rank, trust_remote_
                 yield {"text": ex.get(field, "")}
             i += 1
 
+def hf_text_iterator_unsharded(name, config, split, field, trust_remote_code=False):
+    """
+    Unsharded iterator (rank-0 only) for building fixed eval sets.
+    """
+    from datasets import load_dataset
+    ds = load_dataset(name, config, split=split, streaming=True, trust_remote_code=trust_remote_code)
+    for ex in ds:
+        yield {"text": ex.get(field, "")}
+
+# ---------------------------
+# Tree utils (for correct NaN/Inf scanning)
+# ---------------------------
+
+def tree_leaves(x: Any):
+    """
+    Yield leaf values from nested dict/list/tuple structures.
+    """
+    if isinstance(x, dict):
+        for v in x.values():
+            yield from tree_leaves(v)
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            yield from tree_leaves(v)
+    else:
+        yield x
+
 # ---------------------------
 # Distributed + utils
 # ---------------------------
@@ -280,7 +329,6 @@ def clip_global(tree, max_norm):
     if max_norm <= 0:
         return tree, 0.0
 
-    # If we ever re-enable this, do it carefully (CPU or rank-0 only)
     gnorm = grad_norm_from_tree(tree)
     if gnorm <= max_norm:
         return tree, gnorm
@@ -367,14 +415,12 @@ def load_safetensors_model(path: str, model: nn.Module) -> bool:
 # ---------- broadcast-from-rank-0 helper ----------
 
 def _broadcast_from_rank0(model: nn.Module, rank: int):
-    # Helpful logs to see which rank is doing what
     print(f"[rank {rank}] starting _broadcast_from_rank0", flush=True)
 
     def push(x):
         if not isinstance(x, mx.array):
             return x
         x0 = x if rank == 0 else mx.zeros_like(x)
-        # Broadcast on CPU stream to avoid Metal GPU timeout
         try:
             return mx.distributed.all_sum(x0, stream=mx.cpu)
         except TypeError:
@@ -392,15 +438,174 @@ def _make_compiled_step(model: nn.Module):
     """
     Build a per-microstep function that returns (loss, grads) and
     matches the call pattern: step(X, Y).
-    We intentionally do NOT mx.compile this, because combining
-    mx.compile + nn.value_and_grad has been unstable in some setups.
+    We intentionally do NOT mx.compile this.
     """
     def loss_fn(x, y):
         return model(x, y)["loss"]
 
-    # This wires gradients w.r.t. model.trainable_parameters()
     step = nn.value_and_grad(model, loss_fn)
     return step
+
+# ---------------------------
+# Fixed eval set (rank-0 only)
+# ---------------------------
+
+def _tokenize_to_xy(text: str, seq_len: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Tokenize a text and return (x_ids, y_ids) as numpy int32 arrays length seq_len.
+    """
+    if TOK is None:
+        raise RuntimeError("Tokenizer not initialized. Call set_tokenizer() first.")
+    if not text:
+        return None
+
+    ids = TOK.encode(text)
+    if len(ids) < 2:
+        return None
+
+    ids = ids[: seq_len + 1]
+    x_ids = ids[:-1]
+    y_ids = ids[1:]
+
+    if len(x_ids) < seq_len:
+        pad = seq_len - len(x_ids)
+        x_ids = x_ids + [PAD_ID_RUNTIME] * pad
+        y_ids = y_ids + [PAD_ID_RUNTIME] * pad
+
+    return (np.asarray(x_ids, dtype=np.int32), np.asarray(y_ids, dtype=np.int32))
+
+def build_or_load_fixed_eval_set(
+    *,
+    eval_cache_path: Optional[str],
+    dataset_name: str,
+    dataset_config: Optional[str],
+    split: str,
+    text_field: str,
+    trust_remote_code: bool,
+    seq_len: int,
+    batch_size: int,
+    num_batches: int,
+    shuffle_buffer: int,
+    shuffle_seed: int,
+) -> Optional[Tuple[np.ndarray, np.ndarray, Dict[str, Any]]]:
+    """
+    Returns (X_eval, Y_eval, meta) where:
+      X_eval shape: (num_batches, batch_size, seq_len) int32
+      Y_eval shape: (num_batches, batch_size, seq_len) int32
+
+    If eval_cache_path exists, load it. Otherwise build it from HF streaming iterator and optionally save it.
+    """
+    # Load cache if present
+    if eval_cache_path and os.path.exists(eval_cache_path):
+        try:
+            data = np.load(eval_cache_path, allow_pickle=False)
+            X = data["X"]
+            Y = data["Y"]
+            meta_json = data["meta"].item() if "meta" in data else "{}"
+            meta = json.loads(meta_json) if isinstance(meta_json, str) else {}
+            if X.shape[0] != num_batches or X.shape[1] != batch_size or X.shape[2] != seq_len:
+                print(
+                    f"[eval] ⚠️ eval cache shape mismatch; ignoring cache: "
+                    f"X={X.shape} expected=({num_batches},{batch_size},{seq_len})",
+                    flush=True,
+                )
+            else:
+                print(f"[eval] loaded fixed eval set from {eval_cache_path} X={X.shape}", flush=True)
+                return X, Y, meta
+        except Exception as e:
+            print(f"[eval] ⚠️ failed to load eval cache {eval_cache_path}: {e!r}", flush=True)
+
+    # Build from streaming dataset
+    print(
+        f"[eval] building fixed eval set: dataset={dataset_name}/{dataset_config} split={split} "
+        f"field={text_field} batches={num_batches} bs={batch_size} seq_len={seq_len}",
+        flush=True,
+    )
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        dataset_name,
+        dataset_config,
+        split=split,
+        streaming=True,
+        trust_remote_code=trust_remote_code,
+    )
+
+    # Shuffle to avoid always sampling the same “first documents”.
+    # This is deterministic given seed+buffer_size (as deterministic as HF iterable shuffle can be).
+    if shuffle_buffer and shuffle_buffer > 0:
+        ds = ds.shuffle(buffer_size=shuffle_buffer, seed=shuffle_seed)
+
+    X = np.zeros((num_batches, batch_size, seq_len), dtype=np.int32)
+    Y = np.zeros((num_batches, batch_size, seq_len), dtype=np.int32)
+
+    filled_batches = 0
+    filled_in_batch = 0
+
+    for ex in ds:
+        text = ex.get(text_field, "")
+        xy = _tokenize_to_xy(text, seq_len)
+        if xy is None:
+            continue
+
+        x_ids, y_ids = xy
+        X[filled_batches, filled_in_batch, :] = x_ids
+        Y[filled_batches, filled_in_batch, :] = y_ids
+        filled_in_batch += 1
+
+        if filled_in_batch == batch_size:
+            filled_batches += 1
+            filled_in_batch = 0
+            if filled_batches >= num_batches:
+                break
+
+    if filled_batches < num_batches:
+        print(f"[eval] ⚠️ only built {filled_batches}/{num_batches} eval batches (dataset stream ended?)", flush=True)
+        if filled_batches == 0:
+            return None
+
+        X = X[:filled_batches]
+        Y = Y[:filled_batches]
+
+    meta = {
+        "dataset": dataset_name,
+        "dataset_config": dataset_config,
+        "split": split,
+        "text_field": text_field,
+        "seq_len": seq_len,
+        "batch_size": batch_size,
+        "num_batches": int(X.shape[0]),
+        "shuffle_buffer": shuffle_buffer,
+        "shuffle_seed": shuffle_seed,
+        "created_unix": time.time(),
+    }
+
+    if eval_cache_path:
+        try:
+            os.makedirs(os.path.dirname(eval_cache_path) or ".", exist_ok=True)
+            np.savez_compressed(eval_cache_path, X=X, Y=Y, meta=json.dumps(meta))
+            print(f"[eval] saved fixed eval set to {eval_cache_path}", flush=True)
+        except Exception as e:
+            print(f"[eval] ⚠️ failed to save eval cache {eval_cache_path}: {e!r}", flush=True)
+
+    return X, Y, meta
+
+def eval_on_fixed_set(model: TinyGPLM, X_eval: np.ndarray, Y_eval: np.ndarray) -> Tuple[float, float]:
+    """
+    Compute mean loss and ppl over the fixed eval set.
+    """
+    losses_list = []
+    for i in range(X_eval.shape[0]):
+        X = mx.array(X_eval[i], dtype=mx.int32)
+        Y = mx.array(Y_eval[i], dtype=mx.int32)
+        out = model(X, Y)
+        loss = out["loss"]
+        mx.eval(loss)
+        losses_list.append(float(loss.item()))
+
+    mean_loss = float(np.mean(losses_list)) if losses_list else float("inf")
+    ppl = float(math.exp(min(20.0, mean_loss)))
+    return mean_loss, ppl
 
 # ---------------------------
 # Training
@@ -430,13 +635,26 @@ def train_hf_distributed(
     resume_ckpt: Optional[str] = None,
     config_path: Optional[str] = None,
     lr_decay_start_step: Optional[int] = None,
+    # NEW: fixed eval loss
+    eval_loss_every: int = 0,
+    eval_num_batches: int = 64,
+    eval_cache: Optional[str] = None,
+    eval_dataset: Optional[str] = None,
+    eval_dataset_config: Optional[str] = None,
+    eval_split: str = "train",
+    eval_text_field: Optional[str] = None,
+    eval_batch_size: int = 0,  # 0 => use train batch_size
+    eval_shuffle_buffer: int = 10_000,
+    eval_shuffle_seed: int = 1234,
+    # NEW: EMA smoothing
+    ema_beta: float = 0.99,
 ):
     _, world, rank = init_dist(backend=backend, expected_world=expected_world)
     print(f"[rank {rank}] entering train_hf_distributed", flush=True)
 
     # Rank 0 uses full seq_len; other ranks use a shorter local_seq_len
     if world > 1 and rank != 0:
-        local_seq_len = max(1, seq_len // 4)  # e.g., 2048 -> 512
+        local_seq_len = max(1, seq_len // 4)
     else:
         local_seq_len = seq_len
     print(f"[rank {rank}] using local_seq_len={local_seq_len} (global seq_len={seq_len})", flush=True)
@@ -472,13 +690,13 @@ def train_hf_distributed(
             print(f"[rank 0] resume from {resume_ckpt} at step {update_step}", flush=True)
         else:
             print(f"[rank 0] resume requested but failed, training from scratch", flush=True)
+
     mx.eval(model.parameters())
     if world > 1:
         print(f"[rank {rank}] broadcasting parameters from rank 0", flush=True)
         _broadcast_from_rank0(model, rank)
 
     # Approximate number of dataset examples to skip when resuming.
-    # For world=1 and batch_size=1, each step uses exactly one example.
     skip_examples = update_step * batch_size if resume_ckpt else 0
     if rank == 0 and skip_examples > 0:
         print(
@@ -496,6 +714,37 @@ def train_hf_distributed(
     else:
         decay_start = int(max_steps * 0.5)
 
+    # ---------------------------
+    # Build/load fixed eval set (rank 0 only)
+    # ---------------------------
+    X_eval = Y_eval = None
+    eval_meta = None
+    if rank == 0 and eval_loss_every and eval_loss_every > 0:
+        _eval_ds = eval_dataset if eval_dataset else dataset_name
+        _eval_cfg = eval_dataset_config if eval_dataset_config is not None else dataset_config
+        _eval_field = eval_text_field if eval_text_field else text_field
+        _eval_bs = eval_batch_size if eval_batch_size and eval_batch_size > 0 else batch_size
+
+        fixed = build_or_load_fixed_eval_set(
+            eval_cache_path=eval_cache,
+            dataset_name=_eval_ds,
+            dataset_config=_eval_cfg,
+            split=eval_split,
+            text_field=_eval_field,
+            trust_remote_code=trust_remote_code,
+            seq_len=seq_len,  # use global seq_len for eval consistency
+            batch_size=_eval_bs,
+            num_batches=eval_num_batches,
+            shuffle_buffer=eval_shuffle_buffer,
+            shuffle_seed=eval_shuffle_seed,
+        )
+        if fixed is not None:
+            X_eval, Y_eval, eval_meta = fixed
+            print(f"[eval] fixed eval ready: batches={X_eval.shape[0]} bs={X_eval.shape[1]} seq={X_eval.shape[2]}", flush=True)
+        else:
+            print("[eval] ⚠️ fixed eval requested but could not be built; disabling eval loss.", flush=True)
+            eval_loss_every = 0
+
     sample_iter = hf_text_iterator(dataset_name, dataset_config, split, text_field, world, rank, trust_remote_code)
 
     def batch_iterator():
@@ -505,7 +754,6 @@ def train_hf_distributed(
         skipped = 0
 
         for ex in sample_iter:
-            # Skip examples if resuming, before building batches
             if skipped < skip_examples:
                 skipped += 1
                 continue
@@ -552,6 +800,12 @@ def train_hf_distributed(
     accum_grads = None
     last = time.time()
 
+    # EMA loss (rank 0 only, but safe for all ranks)
+    ema = None
+    beta = float(ema_beta)
+    if beta < 0.0 or beta >= 1.0:
+        beta = 0.99
+
     for _ in range(max_steps * max(1, accum_steps) * 10**9):
         X, Y = next_batch()
         if X is None:
@@ -560,20 +814,22 @@ def train_hf_distributed(
         loss, grads = step(X, Y)
         mx.eval(loss, grads)
 
-        # 1) NaN/Inf checks
+        # 1) NaN/Inf checks (loss)
         if bool(mx.isnan(loss)) or bool(mx.isinf(loss)):
             if rank == 0:
                 print(f"[{update_step}] ⚠️ NaN/Inf loss; skipping micro-step", flush=True)
             continue
 
-        def _bad(g):
+        # 2) NaN/Inf checks (grads) - fixed leaf traversal
+        def _bad_tensor(g):
             return isinstance(g, mx.array) and (bool(mx.isnan(g).any()) or bool(mx.isinf(g).any()))
-        if any(_bad(g) for g in tree_map(lambda x: x, grads)):
+
+        if any(_bad_tensor(g) for g in tree_leaves(grads)):
             if rank == 0:
                 print(f"[{update_step}] ⚠️ NaN/Inf grads; skipping micro-step", flush=True)
             continue
 
-        # 2) Grad scaling & accumulation
+        # 3) Grad scaling & accumulation
         grads = tree_map(
             lambda g: g / accum_steps if isinstance(g, mx.array) else g,
             grads,
@@ -588,7 +844,6 @@ def train_hf_distributed(
         if micro_accum == accum_steps:
             global_grads = allreduce_grads(accum_grads, world)
 
-            # Disable clipping in multi-host to avoid Metal GPU timeout
             max_norm = model.cfg.max_grad_norm
             if world > 1:
                 max_norm = 0.0
@@ -607,22 +862,38 @@ def train_hf_distributed(
 
             opt.update(model, clipped)
 
+            # EMA update (rank 0 only used in logs)
+            loss_val = float(loss.item())
+            if ema is None:
+                ema = loss_val
+            else:
+                ema = beta * ema + (1.0 - beta) * loss_val
+
             now = time.time()
             dt = now - last
             last = now
+
             if update_step % log_every == 0:
                 toks_local_s = (batch_size * local_seq_len * accum_steps) / max(1e-9, dt)
                 ppl = math.exp(min(20.0, float(loss.item())))
                 lr_cur = getattr(opt, "learning_rate", None)
                 lr_str = f" lr={lr_cur:.6e}" if lr_cur is not None else ""
+
+                ema_str = ""
+                if ema is not None:
+                    ema_ppl = math.exp(min(20.0, float(ema)))
+                    ema_str = f" ema_loss={ema:.4f} ema_ppl={ema_ppl:.2f}"
+
                 if per_rank_logs:
-                    print(f"[{update_step}] rank={rank} loss={loss.item():.4f} "
-                          f"ppl={ppl:.2f} grad_norm={gnorm:.3f}{lr_str} "
-                          f"tok/s={toks_local_s:.0f}")
+                    print(
+                        f"[{update_step}] rank={rank} loss={loss.item():.4f} ppl={ppl:.2f}"
+                        f"{ema_str} grad_norm={gnorm:.3f}{lr_str} tok/s={toks_local_s:.0f}"
+                    )
                 if rank == 0 and not per_rank_logs:
-                    print(f"[{update_step}] loss={loss.item():.4f} ppl={ppl:.2f} "
-                          f"grad_norm={gnorm:.3f}{lr_str} "
-                          f"tok/s≈{toks_local_s * world:.0f}")
+                    print(
+                        f"[{update_step}] loss={loss.item():.4f} ppl={ppl:.2f}"
+                        f"{ema_str} grad_norm={gnorm:.3f}{lr_str} tok/s≈{toks_local_s * world:.0f}"
+                    )
 
             if rank == 0 and update_step > 0 and update_step % save_every == 0:
                 path = os.path.join(save_dir, f"ckpt_{update_step:06d}.safetensors")
@@ -630,11 +901,25 @@ def train_hf_distributed(
                 if not ok:
                     print(f"[{update_step}] ⚠️ checkpoint NOT written: {path}", flush=True)
 
+            # Your existing "sample generation eval"
             if rank == 0 and eval_every and update_step % eval_every == 0:
                 try:
                     run_eval_samples(model, update_step, eval_prompt, eval_tokens)
                 except Exception as e:
                     print(f"[{update_step}] eval failed: {e}")
+
+            # NEW: fixed eval loss/ppl on frozen eval set
+            if rank == 0 and eval_loss_every and eval_loss_every > 0 and X_eval is not None:
+                if update_step > 0 and update_step % eval_loss_every == 0:
+                    try:
+                        ev_loss, ev_ppl = eval_on_fixed_set(model, X_eval, Y_eval)
+                        print(
+                            f"[{update_step}] EVAL_FIXED mean_loss={ev_loss:.4f} mean_ppl={ev_ppl:.2f} "
+                            f"(batches={X_eval.shape[0]} bs={X_eval.shape[1]} seq={X_eval.shape[2]})",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"[{update_step}] ⚠️ EVAL_FIXED failed: {e!r}", flush=True)
 
             update_step += 1
             micro_accum = 0
@@ -660,14 +945,6 @@ def _apply_repetition_penalty_np(
     repetition_penalty: float,
     penalty_window: Optional[int],
 ) -> np.ndarray:
-    """
-    Apply a count-based repetition penalty directly to logits (numpy array).
-
-    - logits_np: shape (vocab_size,)
-    - generated_ids: list of token ids generated so far (including prompt)
-    - repetition_penalty > 1.0: stronger push away from repeats
-    - penalty_window: consider only the last N tokens (None = all)
-    """
     if not generated_ids or repetition_penalty is None or repetition_penalty <= 1.0:
         return logits_np
 
@@ -679,7 +956,6 @@ def _apply_repetition_penalty_np(
     counts = Counter(window_ids)
     for tid, c in counts.items():
         if 0 <= tid < logits_np.shape[0]:
-            # divide by penalty ** count to strongly discourage heavy repeats
             logits_np[tid] /= (repetition_penalty ** c)
 
     return logits_np
@@ -690,9 +966,6 @@ def _greedy_with_repetition_penalty(
     repetition_penalty: float = 1.8,
     penalty_window: int = 32,
 ) -> int:
-    """
-    Deterministic 'greedy' using a count-based repetition penalty in logit space.
-    """
     logits_np = np.array(logits[0], dtype=np.float32)
     logits_np = _apply_repetition_penalty_np(
         logits_np,
@@ -712,14 +985,8 @@ def _sample_next_token(
     repetition_penalty: float = 1.0,
     penalty_window: Optional[int] = None,
 ) -> int:
-    """
-    Sample a next token with optional top-k/top-p and count-based repetition penalty
-    applied in logit space.
-    """
-    # Convert logits to numpy
     logits_np = np.array(logits[0], dtype=np.float32)
 
-    # Apply repetition penalty before softmax
     logits_np = _apply_repetition_penalty_np(
         logits_np,
         generated_ids or [],
@@ -727,12 +994,10 @@ def _sample_next_token(
         penalty_window=penalty_window,
     )
 
-    # Temperature scaling + softmax
     logits_np = logits_np / max(1e-5, float(temperature))
     exp = np.exp(logits_np - np.max(logits_np))
     probs_np = exp / (exp.sum() + 1e-9)
 
-    # ---- top-k filtering ----
     if top_k is not None and top_k > 0 and top_k < probs_np.shape[0]:
         idxs = np.argsort(probs_np)[::-1]
         keep = set(idxs[:top_k])
@@ -742,7 +1007,6 @@ def _sample_next_token(
         if total > 0:
             probs_np /= total
 
-    # ---- top-p (nucleus) filtering ----
     if top_p is not None and 0.0 < top_p < 1.0:
         idxs = np.argsort(probs_np)[::-1]
         cumulative = 0.0
@@ -759,7 +1023,6 @@ def _sample_next_token(
         if total > 0:
             probs_np /= total
 
-    # ---- sample from adjusted distribution ----
     import random
     r = random.random()
     c = 0.0
@@ -768,22 +1031,21 @@ def _sample_next_token(
         if r <= c:
             return int(i)
 
-    # Fallback: argmax
     return int(np.argmax(probs_np))
 
 def generate_greedy_nocache(model: TinyGPLM, prompt: str, max_new_tokens: int = 128) -> str:
-    ids = TOK.encode(prompt)[: model.cfg.max_seq]
+    ids = encode_prompt(prompt)[: model.cfg.max_seq]
     out_ids = ids[:]
     for _ in range(max_new_tokens):
-        x_ids = mx.array([out_ids[:model.cfg.max_seq]], dtype=mx.int32)  # shape (1, T)
-        logits = model.logits(x_ids)  # (1, T, vocab)
-        last_logits = logits[:, -1, :]  # (1, vocab)
+        x_ids = mx.array([out_ids[:model.cfg.max_seq]], dtype=mx.int32)
+        logits = model.logits(x_ids)
+        last_logits = logits[:, -1, :]
 
         next_id = _greedy_with_repetition_penalty(
             last_logits,
             generated_ids=out_ids,
-            repetition_penalty=1.8,   # strong push away from repeats
-            penalty_window=32,        # only care about recent tokens
+            repetition_penalty=1.8,
+            penalty_window=32,
         )
 
         out_ids.append(next_id)
@@ -793,7 +1055,7 @@ def generate_greedy_nocache(model: TinyGPLM, prompt: str, max_new_tokens: int = 
 
 def generate_topk(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
                   temperature: float = 0.8, top_k: int = 40) -> str:
-    ids = TOK.encode(prompt)[: model.cfg.max_seq]
+    ids = encode_prompt(prompt)[: model.cfg.max_seq]
     caches = None
     for tok in ids[:-1]:
         tok_id = mx.array([[tok]], dtype=mx.int32)
@@ -808,7 +1070,7 @@ def generate_topk(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
             top_k=top_k,
             top_p=None,
             generated_ids=out_ids,
-            repetition_penalty=1.5,   # milder than greedy
+            repetition_penalty=1.5,
             penalty_window=64,
         )
         out_ids.append(int(next_id))
@@ -819,7 +1081,7 @@ def generate_topk(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
 
 def generate_topp(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
                   temperature: float = 0.8, top_p: float = 0.9) -> str:
-    ids = TOK.encode(prompt)[: model.cfg.max_seq]
+    ids = encode_prompt(prompt)[: model.cfg.max_seq]
     caches = None
     for tok in ids[:-1]:
         tok_id = mx.array([[tok]], dtype=mx.int32)
@@ -844,10 +1106,6 @@ def generate_topp(model: TinyGPLM, prompt: str, max_new_tokens: int = 128,
     return TOK.decode(out_ids)
 
 def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: int):
-    """
-    Run multiple evaluation prompts with several decoding strategies
-    so you can see different behaviors as training progresses.
-    """
     prompts = [
         ("default", prompt),
         ("story", "Once upon a time, "),
@@ -860,11 +1118,9 @@ def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: in
         print(f"[{step}] === EVAL SAMPLES ({label}) ===")
         print(f"Prompt: {repr(p)}")
 
-        # 1) Greedy with repetition penalty
         greedy_nocache = generate_greedy_nocache(model, p, max_new_tokens)
         print(f"[{step}] [{label}] greedy (no cache):\n{greedy_nocache}\n---")
 
-        # 2) Top-k, fairly conservative
         topk_20_t07 = generate_topk(
             model,
             p,
@@ -874,7 +1130,6 @@ def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: in
         )
         print(f"[{step}] [{label}] top-k (k=20, T=0.7):\n{topk_20_t07}\n---")
 
-        # 3) Top-k, more exploratory
         topk_80_t10 = generate_topk(
             model,
             p,
@@ -884,7 +1139,6 @@ def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: in
         )
         print(f"[{step}] [{label}] top-k (k=80, T=1.0):\n{topk_80_t10}\n---")
 
-        # 4) Top-p (nucleus), conservative
         topp_09_t07 = generate_topp(
             model,
             p,
@@ -894,7 +1148,6 @@ def run_eval_samples(model: TinyGPLM, step: int, prompt: str, max_new_tokens: in
         )
         print(f"[{step}] [{label}] top-p (p=0.9, T=0.7):\n{topp_09_t07}\n---")
 
-        # 5) Top-p, more exploratory
         topp_095_t10 = generate_topp(
             model,
             p,
@@ -930,9 +1183,12 @@ def main():
     p.add_argument("--per-rank-logs", action="store_true")
     p.add_argument("--save-dir", type=str, default="model/checkpoints_spm")
     p.add_argument("--save-every", type=int, default=5000)
+
+    # existing sample-generation eval
     p.add_argument("--eval-every", type=int, default=0)
     p.add_argument("--eval-prompt", type=str, default="Hello, my name is ")
     p.add_argument("--eval-tokens", type=int, default=200)
+
     p.add_argument("--resume", type=str, default=None, help="Path to a .safetensors checkpoint to resume from")
 
     p.add_argument("--spm-model", type=str, required=True,
@@ -952,11 +1208,39 @@ def main():
         help="Step at which to start cosine LR decay (default: 0.5 * max_steps).",
     )
 
+    # NEW: fixed eval loss/ppl on frozen eval set
+    p.add_argument("--eval-loss-every", type=int, default=0,
+                   help="Compute mean loss/ppl on a fixed eval set every N steps (0=off).")
+    p.add_argument("--eval-num-batches", type=int, default=64,
+                   help="Number of fixed eval batches to build (rank 0).")
+    p.add_argument("--eval-cache", type=str, default=None,
+                   help="Optional .npz path to save/load the fixed eval set (keeps eval identical across resumes).")
+    p.add_argument("--eval-dataset", type=str, default=None,
+                   help="Eval dataset name (default: --dataset).")
+    p.add_argument("--eval-dataset-config", type=str, default=None,
+                   help="Eval dataset config (default: --dataset-config).")
+    p.add_argument("--eval-split", type=str, default="train",
+                   help="Eval split (default: train).")
+    p.add_argument("--eval-text-field", type=str, default=None,
+                   help="Eval text field (default: --text-field).")
+    p.add_argument("--eval-batch-size", type=int, default=0,
+                   help="Eval batch size (0 => use --batch-size).")
+    p.add_argument("--eval-shuffle-buffer", type=int, default=10000,
+                   help="Shuffle buffer for eval sampling (rank 0).")
+    p.add_argument("--eval-shuffle-seed", type=int, default=1234,
+                   help="Shuffle seed for eval sampling (rank 0).")
+
+    # NEW: EMA smoothing
+    p.add_argument("--ema-beta", type=float, default=0.99,
+                   help="EMA beta for smoothed loss (higher = smoother).")
+
     args = p.parse_args()
 
     set_tokenizer(args.spm_model)
 
     ds_cfg = None if args.dataset_config in (None, "", "None", "none") else args.dataset_config
+    ev_cfg = None if args.eval_dataset_config in (None, "", "None", "none") else args.eval_dataset_config
+
     train_hf_distributed(
         dataset_name=args.dataset,
         dataset_config=ds_cfg,
@@ -981,6 +1265,17 @@ def main():
         resume_ckpt=args.resume,
         config_path=args.config,
         lr_decay_start_step=args.lr_decay_start_step,
+        eval_loss_every=args.eval_loss_every,
+        eval_num_batches=args.eval_num_batches,
+        eval_cache=args.eval_cache,
+        eval_dataset=args.eval_dataset,
+        eval_dataset_config=ev_cfg,
+        eval_split=args.eval_split,
+        eval_text_field=args.eval_text_field,
+        eval_batch_size=args.eval_batch_size,
+        eval_shuffle_buffer=args.eval_shuffle_buffer,
+        eval_shuffle_seed=args.eval_shuffle_seed,
+        ema_beta=args.ema_beta,
     )
 
 if __name__ == "__main__":

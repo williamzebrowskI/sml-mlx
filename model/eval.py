@@ -15,6 +15,7 @@ Usage (single Mac):
 import argparse
 import os
 import importlib
+import json
 
 import mlx.core as mx
 
@@ -42,24 +43,35 @@ def eval_checkpoint(
     seq_len: int,
     max_new_tokens: int,
     prompt: str,
+    config_path: str | None = None,
 ):
     # 1. Initialize tokenizer globals
     set_tokenizer(spm_model)
 
     # IMPORTANT: get vocab size from the module-global TOK after set_tokenizer()
-    vocab_size = mdl.TOK.vocab_size
+    cfg_kwargs = {
+        "vocab_size": mdl.TOK.vocab_size,
+        "d_model": 384,
+        "n_heads": 6,
+        "n_layers": 12,
+        "max_seq": seq_len,
+        "max_grad_norm": 1.0,
+    }
+    # Optional JSON config overrides (e.g., 100M/333M variants)
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg_json = json.load(f)
+        for k in ("vocab_size", "d_model", "n_heads", "n_layers", "max_seq", "max_grad_norm"):
+            if k in cfg_json:
+                cfg_kwargs[k] = cfg_json[k]
+        # If seq_len flag is set, cap max_seq accordingly
+        if seq_len:
+            cfg_kwargs["max_seq"] = min(seq_len, cfg_kwargs.get("max_seq", seq_len))
 
-    # 2. Build model with same config as training
-    cfg = TinyGPConfig(
-        vocab_size=vocab_size,
-        d_model=384,
-        n_heads=6,
-        n_layers=12,
-        max_seq=seq_len,
-        max_grad_norm=1.0,
-    )
+    cfg = TinyGPConfig(**cfg_kwargs)
     model = TinyGPLM(cfg)
     mx.eval(model.parameters())
+    vocab_size = cfg.vocab_size
 
     # 3. Load checkpoint
     if not os.path.exists(ckpt_path):
@@ -154,6 +166,12 @@ def main():
         required=True,
         help="Single prompt string to evaluate.",
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional path to JSON config (overrides d_model, n_heads, n_layers, max_seq, vocab_size).",
+    )
 
     args = parser.parse_args()
 
@@ -163,6 +181,7 @@ def main():
         seq_len=args.seq_len,
         max_new_tokens=args.max_new_tokens,
         prompt=args.prompt,
+        config_path=args.config,
     )
 
 

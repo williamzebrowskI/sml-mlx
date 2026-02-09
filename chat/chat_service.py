@@ -1,32 +1,31 @@
 #!/usr/bin/env python
 """
-Greedy-only chat server that reuses model.finetune_eval (unchanged) to generate responses.
+Chat server for SmolSmolTalk-100M using the SAME greedy decoding
+logic as model.finetune_eval, but without appending '\\nAssistant:'.
 
-- Calls the existing finetune_eval.eval_checkpoint under the hood and captures the greedy output.
-- Serves a simple chat UI at /chat.
-- Only greedy decoding; no sampling controls.
+Key behaviours:
 
-Run (from repo root):
-    PYTHONPATH=. python -m chat.chat_service \
-        --ckpt model/checkpoints_smolsmoltalk_sft/smolsmoltalk_sft_125000.safetensors \
-        --spm-model tokenizer/fineweb_spm/spm.model \
-        --seq-len 2048 \
-        --host 0.0.0.0 \
-        --port 8000
-
-Env overrides also work:
-    CHAT_CKPT_PATH=... CHAT_SPM_MODEL=... CHAT_SEQ_LEN=2048 uvicorn chat.chat_service:app --reload
+- Loads model/model.py once (100M config via JSON).
+- For each request, builds a prompt:
+    - If your text starts with "User:", we send it as-is.
+    - Otherwise we send: "User: <your text>" (no trailing "Assistant:").
+- Greedy decoding uses:
+    - mdl._greedy_with_repetition_penalty
+    - repetition_penalty = 1.5
+    - penalty_window     = 128
+    - max_repeat         = 8
+    - stop_phrases       = ["\\nUser:", "User:"]
+- After decoding, we extract only the assistant's reply:
+    - If there's an "Assistant:" marker, we take everything after the *first* one.
+    - Otherwise, if the decoded string starts with the prompt, we strip that prefix.
+    - Then we strip any trailing "\\nUser:" or "User:" at the end.
 """
 
 import argparse
-import asyncio
-import importlib
-import io
-import os
-import contextlib
 import json
+import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional, List
 
 import mlx.core as mx  # type: ignore
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -36,83 +35,211 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 
-# Keep handle to finetune_eval and model for tokenizer setup.
-finetune_eval = importlib.import_module("model.finetune_eval")
-try:
-    mdl = importlib.import_module("model.model")
-except ImportError:
-    mdl = importlib.import_module("model")
+from model import model as mdl  # type: ignore
+
+TinyGPLM = mdl.TinyGPLM
+TinyGPConfig = mdl.TinyGPConfig
 set_tokenizer = mdl.set_tokenizer
+load_safetensors_model = mdl.load_safetensors_model
 
 ROOT = Path(__file__).resolve().parents[1]
+
 DEFAULT_CKPT = os.getenv(
     "CHAT_CKPT_PATH",
-    str(ROOT / "model" / "checkpoints_smolsmoltalk_sft" / "smolsmoltalk_sft_005000.safetensors"),
+    str(
+        ROOT
+        / "model"
+        / "checkpoints_smolsmoltalk_sft_100m"
+        / "smolsmoltalk_sft_020000.safetensors"
+    ),
 )
-DEFAULT_SPM = os.getenv("CHAT_SPM_MODEL", str(ROOT / "tokenizer" / "fineweb_spm" / "spm.model"))
-DEFAULT_SEQ_LEN = int(os.getenv("CHAT_SEQ_LEN", "2048"))
-DEFAULT_CONFIG = os.getenv("CHAT_CONFIG", None)
+DEFAULT_SPM = os.getenv(
+    "CHAT_SPM_MODEL",
+    str(ROOT / "tokenizer" / "fineweb_spm" / "spm.model"),
+)
+DEFAULT_SEQ_LEN = int(os.getenv("CHAT_SEQ_LEN", "3072"))
+DEFAULT_CONFIG = os.getenv(
+    "CHAT_CONFIG",
+    str(ROOT / "configs" / "config_mlx_slm_beta_v2_100m.json"),
+)
 
 
 class GenerateRequest(BaseModel):
     prompt: str
-    max_new_tokens: int = 200
+    max_new_tokens: int = 80
 
 
-def run_finetune_eval_greedy(
+# ---------- Model loading ----------
+
+
+def load_model_once(
     ckpt_path: str,
     spm_model: str,
     seq_len: int,
-    max_new_tokens: int,
+    config_path: Optional[str],
+) -> TinyGPLM:
+    """
+    Load tokenizer, config, and model once at startup.
+    """
+    set_tokenizer(spm_model)
+
+    cfg_kwargs = {
+        "vocab_size": mdl.TOK.vocab_size,
+        "d_model": 384,
+        "n_heads": 6,
+        "n_layers": 12,
+        "max_seq": seq_len,
+        "max_grad_norm": 1.0,
+    }
+
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg_json = json.load(f)
+        for k in ("vocab_size", "d_model", "n_heads", "n_layers", "max_seq", "max_grad_norm"):
+            if k in cfg_json:
+                cfg_kwargs[k] = cfg_json[k]
+        if seq_len:
+            cfg_kwargs["max_seq"] = min(seq_len, cfg_kwargs.get("max_seq", seq_len))
+
+    cfg = TinyGPConfig(**cfg_kwargs)
+    model = TinyGPLM(cfg)
+    mx.eval(model.parameters())
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    ok = load_safetensors_model(ckpt_path, model)
+    if not ok:
+        raise RuntimeError(f"Failed to load checkpoint: {ckpt_path}")
+    mx.eval(model.parameters())
+
+    print(
+        f"[serve] loaded {ckpt_path} "
+        f"(vocab={cfg.vocab_size}, d_model={cfg.d_model}, "
+        f"heads={cfg.n_heads}, layers={cfg.n_layers}, max_seq={cfg.max_seq})"
+    )
+    return model
+
+
+# ---------- Prompt normalization (NO '\\nAssistant:') ----------
+
+
+def normalize_chat_prompt_no_assistant(user_text: str) -> str:
+    """
+    Normalize any input into a one-line user turn *without* appending 'Assistant:'.
+
+    Rules:
+      - If it already starts with 'User:', keep it as-is.
+      - Otherwise, prepend 'User: '.
+    """
+    txt = user_text.strip()
+    if txt.startswith("User:"):
+        return txt
+    return f"User: {txt}"
+
+
+# ---------- Greedy decoding (same as finetune_eval’s greedy) ----------
+
+
+def generate_greedy_local(
+    model: TinyGPLM,
     prompt: str,
-    config_path: str | None = None,
+    max_new_tokens: int,
+    repetition_penalty: float = 1.5,
+    penalty_window: int = 128,
+    max_repeat: int = 8,
+    stop_phrases: Optional[List[str]] = None,
 ) -> str:
     """
-    Invoke model.finetune_eval.eval_checkpoint (unchanged) and capture the greedy block.
+    Greedy decode using mdl._greedy_with_repetition_penalty.
+
+    Stop when:
+      - eos_id
+      - token repeats max_repeat times in a row
+      - decoded text endswith any stop phrase
     """
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        finetune_eval.eval_checkpoint(
-            ckpt_path=ckpt_path,
-            spm_model=spm_model,
-            seq_len=seq_len,
-            max_new_tokens=max_new_tokens,
-            prompt=prompt,
-            config_path=config_path,
+    if stop_phrases is None:
+        stop_phrases = ["\nUser:", "User:"]
+
+    # Inference prompt encoding: BOS + tokens, no EOS.
+    ids = mdl.encode_prompt(prompt)[: model.cfg.max_seq]
+    out_ids = ids[:]
+    last_id = None
+    repeat_run = 0
+
+    for _ in range(max_new_tokens):
+        x_ids = mx.array([out_ids[: model.cfg.max_seq]], dtype=mx.int32)
+        logits = mdl.TinyGPLM.logits(model, x_ids)  # call instance method explicitly
+        last_logits = logits[:, -1, :]
+
+        next_id = mdl._greedy_with_repetition_penalty(
+            last_logits,
+            generated_ids=out_ids,
+            repetition_penalty=repetition_penalty,
+            penalty_window=penalty_window,
         )
-    out = buf.getvalue()
-    if "[greedy]" not in out:
-        return out.strip()
-    chunk = out.split("[greedy]", 1)[1]
-    if "---" in chunk:
-        chunk = chunk.split("---", 1)[0]
-    return chunk.strip()
+
+        out_ids.append(next_id)
+        repeat_run = repeat_run + 1 if next_id == last_id else 1
+        last_id = next_id
+
+        text_so_far = mdl.TOK.decode(out_ids)
+        if (
+            next_id == mdl.TOK.eos_id
+            or repeat_run >= max_repeat
+            or any(text_so_far.endswith(s) for s in stop_phrases)
+        ):
+            break
+
+    return mdl.TOK.decode(out_ids)
 
 
-def _extract_assistant_only(full_text: str, prompt: str) -> str:
+def extract_assistant_only(full_text: str, prompt: str) -> str:
     """
-    Extract only the assistant's reply from a decoded string that may include the prompt.
+    Extract only the assistant's reply from full decoded text.
+
+    For outputs like:
+      'User: ...\\nAssistant: name? Assistant: The capital of France is Paris.\\nUser:'
+
     Strategy:
-      1) If there's an "Assistant:" marker, take everything after the last one.
-      2) Else, drop the prompt prefix if it matches.
-      3) Trim leading/trailing whitespace.
+      1) Find the FIRST 'Assistant:'; take everything after that.
+      2) If not found, but full_text starts with the prompt, strip the prompt.
+      3) Strip trailing '\\nUser:' or 'User:' at the end.
+      4) Trim whitespace.
     """
-    reply = full_text
-    last_assistant = reply.rfind("Assistant:")
-    if last_assistant != -1:
-        reply = reply[last_assistant + len("Assistant:") :]
-    elif prompt and reply.startswith(prompt):
-        reply = reply[len(prompt) :]
+    txt = full_text.strip()
+
+    # 1) Try to find the first "Assistant:"
+    first = txt.find("Assistant:")
+    if first != -1:
+        reply = txt[first + len("Assistant:") :]
+    else:
+        # 2) Fallback: strip the prompt prefix if it matches
+        if prompt and txt.startswith(prompt):
+            reply = txt[len(prompt) :]
+        else:
+            reply = txt
+
+    # 3) Strip trailing User markers if they appear at the end or near the end
+    for marker in ["\nUser:", "User:"]:
+        idx = reply.find(marker)
+        if idx != -1:
+            reply = reply[:idx]
+            break
+
     return reply.strip()
+
+
+# ---------- FastAPI app ----------
 
 
 def build_app(
     ckpt_path: str = DEFAULT_CKPT,
     spm_model: str = DEFAULT_SPM,
     seq_len: int = DEFAULT_SEQ_LEN,
-    config_path: str | None = DEFAULT_CONFIG,
+    config_path: Optional[str] = DEFAULT_CONFIG,
 ) -> FastAPI:
-    app = FastAPI(title="SmolSmolTalk Chat Service", version="0.1.0")
+    app = FastAPI(title="SmolSmolTalk-100M Chat Service", version="0.3.0")
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -125,6 +252,7 @@ def build_app(
     app.state.spm_model = spm_model
     app.state.seq_len = seq_len
     app.state.config_path = config_path
+    app.state.model = load_model_once(ckpt_path, spm_model, seq_len, config_path)
 
     web_dir = Path(__file__).parent
     if web_dir.exists():
@@ -132,7 +260,6 @@ def build_app(
 
     @app.get("/")
     async def root():
-        # Redirect root to the chat UI for convenience
         return RedirectResponse(url="/chat/")
 
     @app.get("/favicon.ico")
@@ -159,22 +286,28 @@ def build_app(
 
     @app.post("/generate")
     async def generate(body: GenerateRequest):
-        loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(
-            None,
-            run_finetune_eval_greedy,
-            app.state.ckpt_path,
-            app.state.spm_model,
-            app.state.seq_len,
-            body.max_new_tokens,
-            body.prompt,
-            app.state.config_path,
+        max_new = min(body.max_new_tokens, 200)
+        user_text = body.prompt.strip()
+
+        # Normalize to "User: ..." *without* appending "Assistant:"
+        prompt = normalize_chat_prompt_no_assistant(user_text)
+
+        full = generate_greedy_local(
+            app.state.model,
+            prompt,
+            max_new_tokens=max_new,
+            repetition_penalty=1.5,
+            penalty_window=128,
         )
+        reply = extract_assistant_only(full, prompt)
+        print(f"[chat] full_decoded={full!r}")
+
         return JSONResponse(
             {
-                "prompt": body.prompt,
-                "completion": text,
-                "greedy": True,
+                "prompt": prompt,
+                "completion": reply,
+                "full_decoded": full,
+                "mode": "greedy_1.5",
             }
         )
 
@@ -192,43 +325,38 @@ def build_app(
 
             message = init.get("message") or init.get("prompt") or ""
             if not message.strip():
-                await ws.send_json({"type": "error", "message": "Message cannot be empty"})
+                await ws.send_multipart(
+                    [{"type": "error", "message": "Message cannot be empty"}]
+                )
                 continue
 
-            max_new_tokens = int(init.get("max_new_tokens", 200))
+            max_new_tokens = min(int(init.get("max_new_tokens", 80)), 200)
 
             await ws.send_json(
                 {
                     "type": "ready",
                     "max_new_tokens": max_new_tokens,
-                    "greedy": True,
+                    "mode": "greedy_1.5",
                 }
             )
 
             try:
-                # Single-turn prompt (no history); append Assistant: if user didn't
-                prompt = message.rstrip()
-                if not prompt.endswith("Assistant:"):
-                    if prompt.endswith("\n"):
-                        prompt = prompt + "Assistant: "
-                    else:
-                        prompt = prompt + "\nAssistant: "
+                user_text = message.strip()
+                prompt = normalize_chat_prompt_no_assistant(user_text)
 
-                loop = asyncio.get_event_loop()
-                text = await loop.run_in_executor(
-                    None,
-                    run_finetune_eval_greedy,
-                    app.state.ckpt_path,
-                    app.state.spm_model,
-                    app.state.seq_len,
-                    max_new_tokens,
+                full = generate_greedy_local(
+                    app.state.model,
                     prompt,
-                    app.state.config_path,
+                    max_new_tokens=max_new_tokens,
+                    repetition_penalty=1.5,
+                    penalty_window=128,
                 )
-                clean = _extract_assistant_only(text, prompt)
-                if not clean:
-                    clean = text.strip()
-                await ws.send_json({"type": "token", "text": clean, "done": True})
+                reply = extract_assistant_only(full, prompt)
+                print(f"[chat] full_decoded={full!r}")
+                if not reply:
+                    reply = full.strip()
+
+                await ws.send_json({"type": "token", "text": reply, "done": True})
             except WebSocketDisconnect:
                 return
             except Exception as e:
@@ -240,12 +368,8 @@ def build_app(
     return app
 
 
-# App instance for uvicorn chat.chat_service:app
-app = build_app()
-
-
 def parse_args():
-    p = argparse.ArgumentParser("Serve Smol-SmolTalk SFT via FastAPI + WebSocket")
+    p = argparse.ArgumentParser("Serve SmolSmolTalk-100M SFT via FastAPI + WebSocket")
     p.add_argument("--ckpt", type=str, default=DEFAULT_CKPT, help="Path to .safetensors checkpoint")
     p.add_argument("--spm-model", type=str, default=DEFAULT_SPM, help="Path to SentencePiece model")
     p.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN, help="Max sequence length")
@@ -259,3 +383,5 @@ if __name__ == "__main__":
     args = parse_args()
     app = build_app(args.ckpt, args.spm_model, args.seq_len, args.config)
     uvicorn.run(app, host=args.host, port=args.port)
+else:
+    app = build_app()

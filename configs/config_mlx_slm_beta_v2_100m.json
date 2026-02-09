@@ -1,0 +1,17 @@
+{
+  "model_type": "tinygplm",
+  "vocab_size": 30000,
+  "d_model": 768,
+  "n_heads": 12,
+  "n_layers": 12,
+  "max_seq": 3072,
+  "mlp_mult": 4,
+  "rope_base": 10000.0,
+  "norm": "rmsnorm",
+  "activation": "silu",
+  "weight_tying": true,
+  "pad_id": 0,
+  "bos_id": 1,
+  "eos_id": 2,
+  "notes": "Config for tinygplm-100m (TinyGPLM ~108M variant)."
+}
