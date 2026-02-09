@@ -1,11 +1,11 @@
 import mlx.core as mx
 
-mx.distributed.init()
-r = mx.distributed.rank()
-w = mx.distributed.world_size()
+g = mx.distributed.init()
+r = g.rank()
+w = g.size()
 
 x = mx.ones((1,)) * (r + 1)
-y = mx.distributed.all_sum(x)
+y = mx.distributed.all_sum(x, group=g)
 mx.eval(y)
 
 if r == 0:
