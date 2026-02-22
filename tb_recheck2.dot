@@ -1,0 +1,12 @@
+graph G {
+  node [shape=rectangle];
+  a [label="mac-1.local"];
+  b [label="mac-2.local"];
+  c [label="mac-4.local"];
+  d [label="mac-3.local"];
+  a -- c [label="en3/en3"]
+  a -- d [label="en4/en4"]
+  b -- d [label="en2/en2"]
+  b -- c [label="en4/en4"]
+  c -- d [label="en5/en5"]
+}

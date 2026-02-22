@@ -21,6 +21,7 @@
   "n_heads": 16,
   "n_layers": 11,
   "mlp_ratio": 4.0,
+  "attention_impl": "vanilla",
   "max_seq_len": 1024,
   "dtype": "bfloat16",
   "max_steps": 20000,

@@ -22,6 +22,7 @@ class TransformerConfig:
     mlp_ratio: float = 4.0
     rope_base: float = 10000.0
     bias: bool = False
+    attention_impl: str = "fast"
 
     def __post_init__(self) -> None:
         if self.vocab_size <= 0:
@@ -36,6 +37,8 @@ class TransformerConfig:
             raise ValueError("n_layers must be > 0")
         if self.mlp_ratio <= 1.0:
             raise ValueError("mlp_ratio must be > 1.0")
+        if self.attention_impl not in {"fast", "vanilla"}:
+            raise ValueError("attention_impl must be one of: fast, vanilla")
 
 
 def _tree_leaves(tree):
@@ -73,6 +76,7 @@ class CausalSelfAttention(nn.Module):
         self.causal_mask = nn.MultiHeadAttention.create_additive_causal_mask(
             cfg.max_seq_len
         )
+        self.attention_impl = cfg.attention_impl
 
     def __call__(
         self,
@@ -105,13 +109,20 @@ class CausalSelfAttention(nn.Module):
             )
         mask = self.causal_mask[:q_len, :k_len]
 
-        attn = mx.fast.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=1.0 / math.sqrt(self.head_dim),
-            mask=mask,
-        )
+        scale = 1.0 / math.sqrt(self.head_dim)
+        if self.attention_impl == "fast":
+            attn = mx.fast.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=scale,
+                mask=mask,
+            )
+        else:
+            scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+            scores = scores + mask[None, None, :, :]
+            probs = mx.softmax(scores.astype(mx.float32), axis=-1).astype(v.dtype)
+            attn = mx.matmul(probs, v)
         out = attn.transpose(0, 2, 1, 3).reshape(bsz, q_len, d_model)
         out = self.proj(out)
         return out, (k, v)
@@ -205,4 +216,3 @@ class TransformerLM(nn.Module):
         # token_ids shape: [B, 1]
         logits, new_caches = self.logits(token_ids, caches=caches)
         return logits[:, -1, :], new_caches
-

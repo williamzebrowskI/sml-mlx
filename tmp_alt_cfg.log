@@ -1,0 +1,44 @@
+Setup for mac-2.local
+=====================
+sudo ifconfig bridge0 down
+sudo ifconfig en5 inet 192.168.0.9 netmask 255.255.255.252
+sudo route change 192.168.0.10 -interface en5
+sudo ifconfig en4 inet 192.168.0.5 netmask 255.255.255.252
+sudo route change 192.168.0.6 -interface en4
+sudo ifconfig en2 inet 192.168.0.1 netmask 255.255.255.252
+sudo route change 192.168.0.2 -interface en2
+
+Enter to continue
+Setup for mac-1.local
+=====================
+sudo ifconfig bridge0 down
+sudo ifconfig en5 inet 192.168.0.10 netmask 255.255.255.252
+sudo route change 192.168.0.9 -interface en5
+sudo ifconfig en3 inet 192.168.0.13 netmask 255.255.255.252
+sudo route change 192.168.0.14 -interface en3
+sudo ifconfig en4 inet 192.168.0.17 netmask 255.255.255.252
+sudo route change 192.168.0.18 -interface en4
+
+Enter to continue
+Setup for mac-4.local
+=====================
+sudo ifconfig bridge0 down
+sudo ifconfig en4 inet 192.168.0.6 netmask 255.255.255.252
+sudo route change 192.168.0.5 -interface en4
+sudo ifconfig en3 inet 192.168.0.14 netmask 255.255.255.252
+sudo route change 192.168.0.13 -interface en3
+sudo ifconfig en5 inet 192.168.0.21 netmask 255.255.255.252
+sudo route change 192.168.0.22 -interface en5
+
+Enter to continue
+Setup for mac-3.local
+=====================
+sudo ifconfig bridge0 down
+sudo ifconfig en2 inet 192.168.0.2 netmask 255.255.255.252
+sudo route change 192.168.0.1 -interface en2
+sudo ifconfig en4 inet 192.168.0.18 netmask 255.255.255.252
+sudo route change 192.168.0.17 -interface en4
+sudo ifconfig en5 inet 192.168.0.22 netmask 255.255.255.252
+sudo route change 192.168.0.21 -interface en5
+
+Enter to continue

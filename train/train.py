@@ -110,9 +110,9 @@ def _flatten_for_safetensors(tree: Any, prefix: str = "", out: Optional[dict] = 
 
 def _all_sum(x: mx.array) -> mx.array:
     try:
-        return mx.distributed.all_sum(x, stream=mx.cpu)
-    except TypeError:
         return mx.distributed.all_sum(x)
+    except TypeError:
+        return mx.distributed.all_sum(x, stream=mx.cpu)
 
 
 def _allreduce_tree(tree: Any, world: int):
@@ -384,6 +384,7 @@ def main():
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--attention-impl", type=str, default="fast", choices=["fast", "vanilla"])
     parser.add_argument("--max-seq-len", type=int, default=1024)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
 
@@ -446,6 +447,7 @@ def main():
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         mlp_ratio=args.mlp_ratio,
+        attention_impl=args.attention_impl,
     )
     model = TransformerLM(cfg)
     _cast_model_floats(model, model_dtype)

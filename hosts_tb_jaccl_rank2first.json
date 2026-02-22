@@ -1,0 +1,54 @@
+[
+  {
+    "ssh": "mac-2.local",
+    "ips": [
+      "192.168.12.203",
+      "192.168.0.10"
+    ],
+    "rdma": [
+      "rdma_en5",
+      null,
+      "rdma_en4",
+      "rdma_en2"
+    ]
+  },
+  {
+    "ssh": "mac-4.local",
+    "ips": [
+      "192.168.12.163",
+      "192.168.0.18"
+    ],
+    "rdma": [
+      "rdma_en3",
+      "rdma_en4",
+      null,
+      "rdma_en5"
+    ]
+  },
+  {
+    "ssh": "mac-3.local",
+    "ips": [
+      "192.168.12.170",
+      "192.168.0.14"
+    ],
+    "rdma": [
+      "rdma_en4",
+      "rdma_en2",
+      "rdma_en5",
+      null
+    ]
+  },
+  {
+    "ssh": "mac-1.local",
+    "ips": [
+      "192.168.12.125",
+      "192.168.0.5"
+    ],
+    "rdma": [
+      null,
+      "rdma_en5",
+      "rdma_en3",
+      "rdma_en4"
+    ]
+  }
+]
