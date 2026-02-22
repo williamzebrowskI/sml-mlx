@@ -109,20 +109,25 @@ def _flatten_for_safetensors(tree: Any, prefix: str = "", out: Optional[dict] = 
     return out
 
 
-def _all_sum(x: mx.array) -> mx.array:
+def _all_sum(x: mx.array, stream_mode: str = "cpu") -> mx.array:
+    if stream_mode == "cpu":
+        try:
+            return mx.distributed.all_sum(x, stream=mx.cpu)
+        except TypeError:
+            return mx.distributed.all_sum(x)
     try:
         return mx.distributed.all_sum(x)
     except TypeError:
         return mx.distributed.all_sum(x, stream=mx.cpu)
 
 
-def _allreduce_tree(tree: Any, world: int):
+def _allreduce_tree(tree: Any, world: int, stream_mode: str = "cpu"):
     if world == 1:
         return tree
 
     def reduce_leaf(v):
         if isinstance(v, mx.array):
-            return _all_sum(v) / world
+            return _all_sum(v, stream_mode=stream_mode) / world
         return v
 
     return tree_map(reduce_leaf, tree)
@@ -216,7 +221,7 @@ def _infer_resume_step(resume_path: str) -> int:
     return 0
 
 
-def _broadcast_model_from_rank0(model: nn.Module, rank: int, world: int):
+def _broadcast_model_from_rank0(model: nn.Module, rank: int, world: int, stream_mode: str = "cpu"):
     if world == 1:
         return
 
@@ -224,7 +229,7 @@ def _broadcast_model_from_rank0(model: nn.Module, rank: int, world: int):
         if not isinstance(v, mx.array):
             return v
         src = v if rank == 0 else mx.zeros_like(v)
-        return _all_sum(src)
+        return _all_sum(src, stream_mode=stream_mode)
 
     params = tree_map(bcast, model.parameters())
     model.update(params)
@@ -313,6 +318,7 @@ def _evaluate(
     rank: int,
     world: int,
     ignore_index: int,
+    collective_stream: str,
 ) -> float:
     losses = []
     for i in range(eval_steps):
@@ -326,7 +332,7 @@ def _evaluate(
         )
         loss = model(x, targets=y, ignore_index=ignore_index)["loss"]
         if world > 1:
-            loss = _all_sum(loss) / world
+            loss = _all_sum(loss, stream_mode=collective_stream) / world
         mx.eval(loss)
         losses.append(float(loss.item()))
     return float(sum(losses) / max(1, len(losses)))
@@ -412,6 +418,13 @@ def main():
     )
 
     parser.add_argument("--backend", type=str, default=os.getenv("MLX_BACKEND", "jaccl"))
+    parser.add_argument(
+        "--collective-stream",
+        type=str,
+        default="cpu",
+        choices=["cpu", "default"],
+        help="Stream for distributed collectives. cpu is safer on some macOS/Metal setups.",
+    )
     parser.add_argument("--expected-world", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1337)
 
@@ -479,7 +492,8 @@ def main():
         print(
             f"[train] world={world} backend={args.backend} "
             f"seq={args.max_seq_len} batch={args.batch_size} accum={args.grad_accum} "
-            f"opt_mode={'rank0_only' if args.optimizer_rank0_only else 'all_ranks'}",
+            f"opt_mode={'rank0_only' if args.optimizer_rank0_only else 'all_ranks'} "
+            f"collective_stream={args.collective_stream}",
             flush=True,
         )
 
@@ -494,7 +508,7 @@ def main():
                 flush=True,
             )
 
-    _broadcast_model_from_rank0(model, rank, world)
+    _broadcast_model_from_rank0(model, rank, world, stream_mode=args.collective_stream)
 
     train_stream = None
     if args.data_mode == "tokens":
@@ -601,7 +615,7 @@ def main():
 
         grads_acc = _tree_scale(grads_acc, 1.0 / float(args.grad_accum))
         if world > 1:
-            grads_acc = _allreduce_tree(grads_acc, world)
+            grads_acc = _allreduce_tree(grads_acc, world, stream_mode=args.collective_stream)
 
         grads_acc, grad_norm = _clip_grads(grads_acc, args.grad_clip)
         lr_t = lr_for_step(step)
@@ -610,7 +624,7 @@ def main():
                 optimizer.learning_rate = lr_t
                 optimizer.update(model, grads_acc)
                 mx.eval(model.parameters(), optimizer.state)
-            _broadcast_model_from_rank0(model, rank, world)
+            _broadcast_model_from_rank0(model, rank, world, stream_mode=args.collective_stream)
         else:
             optimizer.learning_rate = lr_t
             optimizer.update(model, grads_acc)
@@ -618,7 +632,7 @@ def main():
 
         step_loss = mx.array(total_loss_local / float(args.grad_accum), dtype=mx.float32)
         if world > 1:
-            step_loss = _all_sum(step_loss) / world
+            step_loss = _all_sum(step_loss, stream_mode=args.collective_stream) / world
         mx.eval(step_loss)
         step_loss_value = float(step_loss.item())
         if not math.isfinite(step_loss_value) or not math.isfinite(grad_norm):
@@ -652,6 +666,7 @@ def main():
                 rank=rank,
                 world=world,
                 ignore_index=args.ignore_index,
+                collective_stream=args.collective_stream,
             )
             if rank == 0:
                 val_ppl = math.exp(min(20.0, val_loss))
