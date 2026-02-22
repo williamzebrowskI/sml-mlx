@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import os
+import socket
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -448,6 +449,7 @@ def main():
 
     rank = int(group.rank() if callable(getattr(group, "rank", None)) else group.rank)
     world = int(group.size() if callable(getattr(group, "size", None)) else group.size)
+    print(f"[rank {rank}] host={socket.gethostname()} world={world}", flush=True)
     if args.expected_world is not None and world != args.expected_world:
         raise RuntimeError(f"Expected world={args.expected_world}, got {world}")
 
