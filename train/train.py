@@ -8,10 +8,7 @@ Recommended launch (4 hosts, JACCL):
     --backend jaccl -- \
     /Users/williamzebrowski/sml-mlx/.venv/bin/python3 \
     /Users/williamzebrowski/sml-mlx/train/train.py \
-    --backend jaccl --expected-world 4 \
-    --train-tokens /path/to/train_tokens.npy \
-    --val-tokens /path/to/val_tokens.npy \
-    --vocab-size 50000
+    --config /Users/williamzebrowski/sml-mlx/train/config.json
 """
 
 from __future__ import annotations
@@ -35,8 +32,24 @@ from mlx.utils import tree_map
 
 try:
     from .model import TransformerConfig, TransformerLM, count_parameters
+    from .data import (
+        HFStreamingBatcher,
+        StreamingDatasetAdapter,
+        data_state_path,
+        load_data_state,
+        parse_source_configs,
+        save_data_state,
+    )
 except ImportError:
     from model import TransformerConfig, TransformerLM, count_parameters
+    from data import (
+        HFStreamingBatcher,
+        StreamingDatasetAdapter,
+        data_state_path,
+        load_data_state,
+        parse_source_configs,
+        save_data_state,
+    )
 
 
 def _tree_leaves(tree: Any):
@@ -184,6 +197,24 @@ def _load_checkpoint(path: str, model: nn.Module) -> bool:
     return True
 
 
+def _infer_resume_step(resume_path: str) -> int:
+    meta_path = resume_path + ".json"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            return int(meta.get("step", 0))
+        except Exception:
+            pass
+
+    stem = Path(resume_path).stem
+    if "_" in stem:
+        tail = stem.rsplit("_", 1)[-1]
+        if tail.isdigit():
+            return int(tail)
+    return 0
+
+
 def _broadcast_model_from_rank0(model: nn.Module, rank: int, world: int):
     if world == 1:
         return
@@ -238,7 +269,6 @@ class TokenDataset:
             y[i] = np.asarray(chunk[1:], dtype=np.int32)
 
         return mx.array(x, dtype=mx.int32), mx.array(y, dtype=mx.int32)
-
 
 def _resolve_dtype(name: str):
     table = {
@@ -321,9 +351,33 @@ def main():
         parents=[pre],
         description="Small distributed MLX pretraining runner (36 GB worker-friendly defaults)"
     )
+    parser.add_argument("--data-mode", type=str, default="tokens", choices=["tokens", "hf_stream"])
     parser.add_argument("--train-tokens", type=str, default="", help="Path to train tokens (.npy or flat binary)")
     parser.add_argument("--val-tokens", type=str, default="", help="Optional validation tokens (.npy or flat binary)")
     parser.add_argument("--token-dtype", type=str, default="uint16", choices=["uint16", "uint32", "int32"])
+    parser.add_argument(
+        "--spm-model",
+        type=str,
+        default="/Users/williamzebrowski/sml-mlx/tokenizer/fineweb_spm/spm.model",
+        help="SentencePiece model used for HF text streaming mode.",
+    )
+    parser.add_argument(
+        "--train-sources",
+        type=str,
+        default="",
+        help="HF source list (JSON string or path) for data-mode=hf_stream.",
+    )
+    parser.add_argument(
+        "--val-sources",
+        type=str,
+        default="",
+        help="Optional HF source list (JSON string or path) for eval in hf_stream mode.",
+    )
+    parser.set_defaults(add_bos=True, add_eos=True)
+    parser.add_argument("--add-bos", action="store_true", dest="add_bos")
+    parser.add_argument("--no-add-bos", action="store_false", dest="add_bos")
+    parser.add_argument("--add-eos", action="store_true", dest="add_eos")
+    parser.add_argument("--no-add-eos", action="store_false", dest="add_eos")
     parser.add_argument("--vocab-size", type=int, default=0)
 
     parser.add_argument("--d-model", type=int, default=768)
@@ -367,10 +421,12 @@ def main():
         parser.set_defaults(config=str(cfg_path))
 
     args = parser.parse_args(remaining)
-    if not args.train_tokens:
-        raise ValueError("Missing --train-tokens (or train_tokens in --config).")
     if args.vocab_size <= 0:
         raise ValueError("Missing/invalid --vocab-size (or vocab_size in --config).")
+    if args.data_mode == "tokens" and not args.train_tokens:
+        raise ValueError("Missing --train-tokens (or train_tokens in --config).")
+    if args.data_mode == "hf_stream" and not args.train_sources:
+        raise ValueError("Missing --train-sources (or train_sources in --config) for hf_stream mode.")
 
     try:
         group = mx.distributed.init(backend=args.backend, strict=True)
@@ -410,21 +466,87 @@ def main():
             flush=True,
         )
 
+    start_step = 0
     if args.resume:
         loaded = _load_checkpoint(args.resume, model)
+        if loaded:
+            start_step = _infer_resume_step(args.resume)
         if rank == 0:
-            print(f"[ckpt] resume={args.resume} loaded={loaded}", flush=True)
+            print(
+                f"[ckpt] resume={args.resume} loaded={loaded} start_step={start_step}",
+                flush=True,
+            )
 
     _broadcast_model_from_rank0(model, rank, world)
 
-    train_data = TokenDataset(args.train_tokens, args.token_dtype)
-    val_data = TokenDataset(args.val_tokens, args.token_dtype) if args.val_tokens else None
-    if rank == 0:
-        print(
-            f"[data] train_tokens={train_data.n_tokens:,}"
-            + (f" val_tokens={val_data.n_tokens:,}" if val_data else ""),
-            flush=True,
+    train_stream = None
+    if args.data_mode == "tokens":
+        train_data = TokenDataset(args.train_tokens, args.token_dtype)
+        val_data = TokenDataset(args.val_tokens, args.token_dtype) if args.val_tokens else None
+        if rank == 0:
+            print(
+                f"[data] mode=tokens train_tokens={train_data.n_tokens:,}"
+                + (f" val_tokens={val_data.n_tokens:,}" if val_data else ""),
+                flush=True,
+            )
+    else:
+        train_sources = parse_source_configs(args.train_sources)
+        val_sources = parse_source_configs(args.val_sources) if args.val_sources else []
+        train_stream = HFStreamingBatcher(
+            sources=train_sources,
+            spm_model=args.spm_model,
+            world_size=world,
+            rank=rank,
+            seed=args.seed,
+            add_bos=args.add_bos,
+            add_eos=args.add_eos,
         )
+        train_data = StreamingDatasetAdapter(train_stream)
+
+        if val_sources:
+            val_stream = HFStreamingBatcher(
+                sources=val_sources,
+                spm_model=args.spm_model,
+                world_size=world,
+                rank=rank,
+                seed=args.seed + 99991,
+                add_bos=args.add_bos,
+                add_eos=args.add_eos,
+            )
+            val_data = StreamingDatasetAdapter(val_stream)
+        else:
+            val_data = None
+
+        if rank == 0:
+            print(
+                f"[data] mode=hf_stream train_sources={len(train_sources)} "
+                f"val_sources={len(val_sources)} spm_model={args.spm_model}",
+                flush=True,
+            )
+            if any(s.shuffle_buffer > 0 for s in train_sources):
+                print(
+                    "[warn] shuffle_buffer>0 reduces exact data-cursor resume fidelity. "
+                    "Use shuffle_buffer=0 for exact-ish resume.",
+                    flush=True,
+                )
+
+        if args.resume:
+            ds_path = data_state_path(args.resume, rank)
+            payload = load_data_state(ds_path)
+            if payload is not None:
+                state = payload.get("stream_state", payload)
+                train_stream.load_state_dict(state)
+                if "step" in payload:
+                    start_step = max(start_step, int(payload["step"]))
+                print(
+                    f"[rank {rank}] loaded data state from {ds_path} (step={payload.get('step', 'n/a')})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[rank {rank}] data state not found for resume: {ds_path}",
+                    flush=True,
+                )
 
     optimizer = optim.AdamW(args.lr, weight_decay=args.weight_decay)
     lr_for_step = _build_lr_schedule(
@@ -441,7 +563,7 @@ def main():
     ema_loss = None
     t_loop = time.perf_counter()
 
-    for step in range(args.max_steps):
+    for step in range(start_step, args.max_steps):
         t0 = time.perf_counter()
         total_loss_local = 0.0
         grads_acc = None
@@ -509,7 +631,7 @@ def main():
                     flush=True,
                 )
 
-        if rank == 0 and args.save_every > 0 and ((step + 1) % args.save_every == 0):
+        if args.save_every > 0 and ((step + 1) % args.save_every == 0):
             ckpt_path = os.path.join(args.save_dir, f"step_{step+1:07d}.safetensors")
             metadata = {
                 "step": step + 1,
@@ -519,11 +641,17 @@ def main():
                 "backend": args.backend,
                 "timestamp": time.time(),
             }
-            _save_checkpoint(ckpt_path, model, metadata)
-            print(f"[ckpt] saved {ckpt_path}", flush=True)
+            if rank == 0:
+                _save_checkpoint(ckpt_path, model, metadata)
+                print(f"[ckpt] saved {ckpt_path}", flush=True)
+            if args.data_mode == "hf_stream" and train_stream is not None:
+                ds_payload = {"step": step + 1, "stream_state": train_stream.state_dict()}
+                save_data_state(data_state_path(ckpt_path, rank), ds_payload)
+                if rank == 0:
+                    print(f"[ckpt] saved data-state for all ranks at step {step+1}", flush=True)
 
+    final_path = os.path.join(args.save_dir, "final.safetensors")
     if rank == 0:
-        final_path = os.path.join(args.save_dir, "final.safetensors")
         metadata = {
             "step": args.max_steps,
             "args": vars(args),
@@ -535,6 +663,11 @@ def main():
         }
         _save_checkpoint(final_path, model, metadata)
         print(f"[done] saved {final_path}", flush=True)
+    if args.data_mode == "hf_stream" and train_stream is not None:
+        save_data_state(
+            data_state_path(final_path, rank),
+            {"step": args.max_steps, "stream_state": train_stream.state_dict()},
+        )
 
 
 if __name__ == "__main__":

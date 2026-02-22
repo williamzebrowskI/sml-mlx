@@ -1,6 +1,20 @@
 {
-  "train_tokens": "/Users/williamzebrowski/sml-mlx/data/tokens/train_tokens.npy",
-  "val_tokens": "/Users/williamzebrowski/sml-mlx/data/tokens/val_tokens.npy",
+  "data_mode": "hf_stream",
+  "train_tokens": "",
+  "val_tokens": "",
+  "spm_model": "/Users/williamzebrowski/sml-mlx/tokenizer/fineweb_spm/spm.model",
+  "train_sources": [
+    {
+      "name": "HuggingFaceFW/fineweb-edu",
+      "config": null,
+      "split": "train",
+      "text_field": "text",
+      "weight": 1,
+      "shuffle_buffer": 0,
+      "trust_remote_code": false
+    }
+  ],
+  "val_sources": [],
   "token_dtype": "uint16",
   "vocab_size": 50000,
   "d_model": 1024,
@@ -22,7 +36,7 @@
   "expected_world": 4,
   "seed": 1337,
   "log_every": 10,
-  "eval_every": 200,
+  "eval_every": 0,
   "eval_steps": 20,
   "save_dir": "/Users/williamzebrowski/sml-mlx/train/checkpoints/small_lm_200m_v1",
   "save_every": 500,
