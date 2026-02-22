@@ -397,6 +397,18 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--ignore-index", type=int, default=-100)
+    parser.set_defaults(optimizer_rank0_only=False)
+    parser.add_argument(
+        "--optimizer-rank0-only",
+        action="store_true",
+        dest="optimizer_rank0_only",
+        help="Only rank 0 applies optimizer updates; other ranks receive weights via broadcast each step.",
+    )
+    parser.add_argument(
+        "--no-optimizer-rank0-only",
+        action="store_false",
+        dest="optimizer_rank0_only",
+    )
 
     parser.add_argument("--backend", type=str, default=os.getenv("MLX_BACKEND", "jaccl"))
     parser.add_argument("--expected-world", type=int, default=None)
@@ -464,7 +476,8 @@ def main():
         )
         print(
             f"[train] world={world} backend={args.backend} "
-            f"seq={args.max_seq_len} batch={args.batch_size} accum={args.grad_accum}",
+            f"seq={args.max_seq_len} batch={args.batch_size} accum={args.grad_accum} "
+            f"opt_mode={'rank0_only' if args.optimizer_rank0_only else 'all_ranks'}",
             flush=True,
         )
 
@@ -590,9 +603,16 @@ def main():
 
         grads_acc, grad_norm = _clip_grads(grads_acc, args.grad_clip)
         lr_t = lr_for_step(step)
-        optimizer.learning_rate = lr_t
-        optimizer.update(model, grads_acc)
-        mx.eval(model.parameters(), optimizer.state)
+        if args.optimizer_rank0_only and world > 1:
+            if rank == 0:
+                optimizer.learning_rate = lr_t
+                optimizer.update(model, grads_acc)
+                mx.eval(model.parameters(), optimizer.state)
+            _broadcast_model_from_rank0(model, rank, world)
+        else:
+            optimizer.learning_rate = lr_t
+            optimizer.update(model, grads_acc)
+            mx.eval(model.parameters(), optimizer.state)
 
         step_loss = mx.array(total_loss_local / float(args.grad_accum), dtype=mx.float32)
         if world > 1:

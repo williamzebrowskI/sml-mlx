@@ -32,6 +32,7 @@
   "warmup_steps": 500,
   "weight_decay": 0.1,
   "grad_clip": 1.0,
+  "optimizer_rank0_only": true,
   "ignore_index": -100,
   "backend": "jaccl",
   "expected_world": 4,
