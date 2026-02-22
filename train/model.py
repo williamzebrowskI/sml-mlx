@@ -198,7 +198,8 @@ class TransformerLM(nn.Module):
         if targets is None:
             return out
 
-        per_token = losses.cross_entropy(logits, targets, reduction="none")
+        # Keep CE math in fp32 for stability when model weights/logits are fp16.
+        per_token = losses.cross_entropy(logits.astype(mx.float32), targets, reduction="none")
         if ignore_index >= 0:
             mask = (targets != ignore_index).astype(per_token.dtype)
             denom = mask.sum() + 1e-6

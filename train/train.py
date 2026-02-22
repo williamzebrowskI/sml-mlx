@@ -599,6 +599,11 @@ def main():
             step_loss = _all_sum(step_loss) / world
         mx.eval(step_loss)
         step_loss_value = float(step_loss.item())
+        if not math.isfinite(step_loss_value) or not math.isfinite(grad_norm):
+            raise FloatingPointError(
+                f"Non-finite at step {step+1}: loss={step_loss_value}, grad_norm={grad_norm}. "
+                "Try --dtype bfloat16 and/or lower --lr."
+            )
 
         ema_loss = step_loss_value if ema_loss is None else (0.98 * ema_loss + 0.02 * step_loss_value)
         dt = time.perf_counter() - t0
