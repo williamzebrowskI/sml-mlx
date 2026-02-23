@@ -464,6 +464,16 @@ def main():
         group = mx.distributed.init(backend=args.backend, strict=True)
     except TypeError:
         group = mx.distributed.init(backend=args.backend)
+    except RuntimeError as e:
+        # Single-host ring launches can provide an empty MLX_HOSTFILE.
+        # Fall back to a non-strict singleton group when explicitly testing world=1.
+        if args.expected_world == 1:
+            try:
+                group = mx.distributed.init(backend="any", strict=False)
+            except TypeError:
+                group = mx.distributed.init(backend="any")
+        else:
+            raise e
 
     rank = int(group.rank() if callable(getattr(group, "rank", None)) else group.rank)
     world = int(group.size() if callable(getattr(group, "size", None)) else group.size)
@@ -615,6 +625,13 @@ def main():
                 rank=rank,
                 stream=micro,
             )
+            if args.data_mode == "hf_stream" and world > 1:
+                # Keep ranks aligned when live streaming can have per-host jitter.
+                if args.trace_first_step and step == start_step:
+                    print(f"[rank {rank}] trace step={step+1} micro={micro} stage=sample_sync", flush=True)
+                ready = mx.array(1.0, dtype=mx.float32)
+                ready = _all_sum(ready, stream_mode=args.collective_stream)
+                mx.eval(ready)
             if args.trace_first_step and step == start_step:
                 print(f"[rank {rank}] trace step={step+1} micro={micro} stage=fwd_bwd", flush=True)
             loss, grads = step_and_grad(x, y)
