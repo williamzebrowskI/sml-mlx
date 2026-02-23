@@ -431,6 +431,11 @@ def main():
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=200)
     parser.add_argument("--eval-steps", type=int, default=20)
+    parser.add_argument(
+        "--trace-first-step",
+        action="store_true",
+        help="Print detailed stage markers for the first training step on each rank.",
+    )
 
     parser.add_argument("--save-dir", type=str, default="/Users/williamzebrowski/sml-mlx/train/checkpoints")
     parser.add_argument("--save-every", type=int, default=500)
@@ -600,6 +605,8 @@ def main():
         grads_acc = None
 
         for micro in range(args.grad_accum):
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} micro={micro} stage=sample_batch", flush=True)
             x, y = train_data.sample_batch(
                 batch_size=args.batch_size,
                 seq_len=args.max_seq_len,
@@ -608,28 +615,44 @@ def main():
                 rank=rank,
                 stream=micro,
             )
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} micro={micro} stage=fwd_bwd", flush=True)
             loss, grads = step_and_grad(x, y)
             mx.eval(loss)
             total_loss_local += float(loss.item())
             grads_acc = grads if grads_acc is None else _tree_add(grads_acc, grads)
 
+        if args.trace_first_step and step == start_step:
+            print(f"[rank {rank}] trace step={step+1} stage=grad_accum_done", flush=True)
         grads_acc = _tree_scale(grads_acc, 1.0 / float(args.grad_accum))
         if world > 1:
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=allreduce_grads", flush=True)
             grads_acc = _allreduce_tree(grads_acc, world, stream_mode=args.collective_stream)
 
+        if args.trace_first_step and step == start_step:
+            print(f"[rank {rank}] trace step={step+1} stage=clip_grads", flush=True)
         grads_acc, grad_norm = _clip_grads(grads_acc, args.grad_clip)
         lr_t = lr_for_step(step)
         if args.optimizer_rank0_only and world > 1:
             if rank == 0:
+                if args.trace_first_step and step == start_step:
+                    print(f"[rank {rank}] trace step={step+1} stage=optimizer_update_rank0", flush=True)
                 optimizer.learning_rate = lr_t
                 optimizer.update(model, grads_acc)
                 mx.eval(model.parameters(), optimizer.state)
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=broadcast_model", flush=True)
             _broadcast_model_from_rank0(model, rank, world, stream_mode=args.collective_stream)
         else:
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=optimizer_update_all", flush=True)
             optimizer.learning_rate = lr_t
             optimizer.update(model, grads_acc)
             mx.eval(model.parameters(), optimizer.state)
 
+        if args.trace_first_step and step == start_step:
+            print(f"[rank {rank}] trace step={step+1} stage=reduce_step_loss", flush=True)
         step_loss = mx.array(total_loss_local / float(args.grad_accum), dtype=mx.float32)
         if world > 1:
             step_loss = _all_sum(step_loss, stream_mode=args.collective_stream) / world

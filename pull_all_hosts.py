@@ -31,8 +31,20 @@ def detect_branch(repo: Path) -> str:
     return branch
 
 
-def remote_pull_cmd(repo: str, branch: str) -> str:
+def remote_pull_cmd(repo: str, branch: str, force: bool = False) -> str:
     # Use sh-compatible command string for broad remote shell compatibility.
+    if force:
+        return (
+            "set -e; "
+            f"cd {shlex.quote(repo)}; "
+            f"git fetch origin {shlex.quote(branch)}; "
+            f"git checkout {shlex.quote(branch)}; "
+            "git stash push -u -m codex-force-sync >/dev/null 2>&1 || true; "
+            f"git reset --hard origin/{shlex.quote(branch)}; "
+            "printf 'branch=%s head=%s mode=force\\n' "
+            '"$(git rev-parse --abbrev-ref HEAD)" '
+            '"$(git rev-parse --short HEAD)"'
+        )
     return (
         "set -e; "
         f"cd {shlex.quote(repo)}; "
@@ -45,8 +57,15 @@ def remote_pull_cmd(repo: str, branch: str) -> str:
     )
 
 
-def run_on_host(host: str, repo: str, branch: str, ssh_opts: list[str], dry_run: bool) -> tuple[bool, str]:
-    cmd = ["ssh", *ssh_opts, host, remote_pull_cmd(repo, branch)]
+def run_on_host(
+    host: str,
+    repo: str,
+    branch: str,
+    ssh_opts: list[str],
+    dry_run: bool,
+    force: bool,
+) -> tuple[bool, str]:
+    cmd = ["ssh", *ssh_opts, host, remote_pull_cmd(repo, branch, force=force)]
     if dry_run:
         return True, shlex.join(cmd)
 
@@ -91,6 +110,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print ssh commands without executing them.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force reset each host to origin/<branch> (stashes local changes first).",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +134,7 @@ def main() -> int:
     print(f"[info] repo={repo}")
     print(f"[info] branch={branch}")
     print(f"[info] hosts={', '.join(args.hosts)}")
+    print(f"[info] force={args.force}")
 
     failures: list[str] = []
     for host in args.hosts:
@@ -120,6 +145,7 @@ def main() -> int:
             branch=branch,
             ssh_opts=args.ssh_option,
             dry_run=args.dry_run,
+            force=args.force,
         )
         if output:
             print(output)
@@ -141,4 +167,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
