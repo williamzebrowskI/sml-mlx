@@ -11,7 +11,7 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -170,6 +170,64 @@ def _estimate_loss(
     return float(sum(losses) / max(1, len(losses)))
 
 
+def _load_sample_tokenizer(tokenizer_name: str):
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    if tok.pad_token_id is None and tok.eos_token_id is not None:
+        tok.pad_token = tok.eos_token
+    return tok
+
+
+def _generate_sample_text(
+    *,
+    model: GPT2LM,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+) -> str:
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if not prompt_ids:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_id is None:
+            raise ValueError("Prompt tokenized to empty ids and tokenizer has no eos_token_id fallback.")
+        prompt_ids = [int(eos_id)]
+
+    vocab_limit = int(getattr(tokenizer, "vocab_size", model.config.vocab_size))
+    out_ids = list(int(x) for x in prompt_ids)
+    was_training = model.training
+    model.eval()
+    try:
+        for _ in range(max_new_tokens):
+            ctx = out_ids[-model.config.block_size :]
+            x = mx.array(np.asarray([ctx], dtype=np.int32), dtype=mx.int32)
+            logits = model.logits(x)[:, -1, :].astype(mx.float32)
+            mx.eval(logits)
+            logits_np = np.asarray(logits[0])[:vocab_limit]
+
+            if temperature <= 0.0 or top_k == 1:
+                next_id = int(np.argmax(logits_np))
+            else:
+                scaled = logits_np / max(temperature, 1e-5)
+                if top_k > 0 and top_k < scaled.shape[0]:
+                    keep = np.argpartition(scaled, -top_k)[-top_k:]
+                    masked = np.full_like(scaled, -np.inf)
+                    masked[keep] = scaled[keep]
+                    scaled = masked
+                scaled = scaled - np.max(scaled)
+                probs = np.exp(scaled)
+                probs = probs / np.clip(probs.sum(), 1e-12, None)
+                next_id = int(np.random.choice(probs.shape[0], p=probs))
+            out_ids.append(next_id)
+    finally:
+        if was_training:
+            model.train()
+
+    return tokenizer.decode(out_ids, clean_up_tokenization_spaces=False)
+
+
 def main() -> None:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default="")
@@ -217,6 +275,11 @@ def main() -> None:
     parser.add_argument("--no-save-stream-state", action="store_false", dest="save_stream_state")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--trace-first-step", action="store_true")
+    parser.add_argument("--sample-prompt", type=str, default="")
+    parser.add_argument("--sample-max-new-tokens", type=int, default=0)
+    parser.add_argument("--sample-temperature", type=float, default=0.8)
+    parser.add_argument("--sample-top-k", type=int, default=40)
+    parser.add_argument("--sample-tokenizer-name", type=str, default="gpt2")
 
     if pre_args.config:
         cfg_path = Path(pre_args.config).resolve()
@@ -364,6 +427,10 @@ def main() -> None:
     tokens_per_iter = args.gradient_accumulation_steps * args.batch_size * model.config.block_size
     num_params = count_parameters(model)
     param_bytes = 2 if model_dtype in (mx.float16, mx.bfloat16) else 4
+    sample_tokenizer: Optional[Any] = None
+    sample_enabled = bool(args.sample_prompt and args.sample_max_new_tokens > 0)
+    if sample_enabled and rank == args.checkpoint_rank:
+        sample_tokenizer = _load_sample_tokenizer(args.sample_tokenizer_name)
     if rank == 0:
         print(f"[rank {rank}] host={socket.gethostname()} world={world}", flush=True)
         print(f"[tokens_per_iter] {tokens_per_iter:,}", flush=True)
@@ -446,6 +513,17 @@ def main() -> None:
                         },
                     )
                     print(f"[ckpt] saved {ckpt_path}", flush=True)
+                    if sample_enabled and rank == args.checkpoint_rank:
+                        sample_text = _generate_sample_text(
+                            model=model,
+                            tokenizer=sample_tokenizer,
+                            prompt=args.sample_prompt,
+                            max_new_tokens=args.sample_max_new_tokens,
+                            temperature=args.sample_temperature,
+                            top_k=args.sample_top_k,
+                        )
+                        print(f"[sample {iter_num:7d}] prompt={args.sample_prompt!r}", flush=True)
+                        print(sample_text, flush=True)
             else:
                 save_ckpt = False
             if save_ckpt and args.save_stream_state:
