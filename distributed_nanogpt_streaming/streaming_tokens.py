@@ -22,7 +22,7 @@ class HFTokenSourceConfig:
     config: Optional[str] = None
     token_field: str = "tokens"
     weight: int = 1
-    shuffle_buffer: int = 0
+    shuffle_buffer: int = 1024
     trust_remote_code: bool = False
     append_eos: bool = False
     eos_token_id: int = 50256
@@ -35,7 +35,7 @@ class HFTokenSourceConfig:
             config=d.get("config"),
             token_field=d.get("token_field", "tokens"),
             weight=int(d.get("weight", 1)),
-            shuffle_buffer=int(d.get("shuffle_buffer", 0)),
+            shuffle_buffer=int(d.get("shuffle_buffer", 1024)),
             trust_remote_code=bool(d.get("trust_remote_code", False)),
             append_eos=bool(d.get("append_eos", False)),
             eos_token_id=int(d.get("eos_token_id", 50256)),
@@ -94,6 +94,8 @@ class _TokenSourceCursor:
             streaming=True,
             trust_remote_code=self.cfg.trust_remote_code,
         )
+        if self.world_size > 1:
+            ds = ds.shard(num_shards=self.world_size, index=self.rank, contiguous=False)
         if self.cfg.shuffle_buffer > 0:
             ds = ds.shuffle(
                 seed=self.base_seed + self.epoch,
@@ -116,7 +118,6 @@ class _TokenSourceCursor:
                 self._reset_dataset()
                 continue
 
-            idx = self.example_index
             self.example_index += 1
 
             tokens = ex.get(self.cfg.token_field)
@@ -153,6 +154,8 @@ class _TokenSourceCursor:
 
 
 class HFTokenStreamingBatcher:
+    _WINDOW_POOL_MULTIPLIER = 16
+
     def __init__(
         self,
         sources: list[HFTokenSourceConfig],
@@ -173,11 +176,11 @@ class HFTokenStreamingBatcher:
         if not self.schedule:
             raise ValueError("Source weights created an empty schedule.")
 
+        self.base_seed = int(seed)
         self.rank = rank
         self.schedule_pos = 0
         self.total_tokens_emitted = 0
         self.total_batches_emitted = 0
-        self.source_initial_skips: list[int] = []
 
     def _next_source_index(self) -> int:
         idx = self.schedule[self.schedule_pos % len(self.schedule)]
@@ -189,26 +192,40 @@ class HFTokenStreamingBatcher:
         while len(src.buffer) < needed:
             src.buffer.extend(src._next_tokens())
 
-    def sample_batch(self, batch_size: int, seq_len: int):
+    def _window_seed(self, *, seed: int, step: int, stream: int, batch_index: int, src_idx: int) -> int:
+        return (
+            int(seed)
+            + (self.rank * 100_003)
+            + (int(step) * 1_000_003)
+            + (int(stream) * 9_973)
+            + (int(batch_index) * 389)
+            + (int(src_idx) * 53)
+            + self.base_seed
+        )
+
+    def sample_batch(self, batch_size: int, seq_len: int, *, seed: int, step: int, stream: int):
         need = seq_len + 1
+        pool_tokens = max(need, seq_len * self._WINDOW_POOL_MULTIPLIER)
         x = np.empty((batch_size, seq_len), dtype=np.int32)
         y = np.empty((batch_size, seq_len), dtype=np.int32)
 
         for i in range(batch_size):
             src_idx = self._next_source_index()
             src = self.sources[src_idx]
-            while len(self.source_initial_skips) <= src_idx:
-                self.source_initial_skips.append(-1)
-            if self.source_initial_skips[src_idx] < 0:
-                self.source_initial_skips[src_idx] = int(self.rank * seq_len)
-            initial_skip = self.source_initial_skips[src_idx]
-            if initial_skip > 0:
-                self._ensure_tokens(src_idx, need + initial_skip)
-                del src.buffer[:initial_skip]
-                self.source_initial_skips[src_idx] = 0
-            self._ensure_tokens(src_idx, need)
+            self._ensure_tokens(src_idx, pool_tokens + need)
+            max_start = max(0, len(src.buffer) - need)
+            if max_start <= 0:
+                start = 0
+            else:
+                rng = np.random.default_rng(
+                    self._window_seed(seed=seed, step=step, stream=stream, batch_index=i, src_idx=src_idx)
+                )
+                start = int(rng.integers(0, max_start + 1))
             chunk = src.buffer[:need]
-            del src.buffer[:seq_len]
+            if start > 0:
+                chunk = src.buffer[start : start + need]
+            advance = min(len(src.buffer), max(seq_len, start + seq_len))
+            del src.buffer[:advance]
             x[i] = np.asarray(chunk[:-1], dtype=np.int32)
             y[i] = np.asarray(chunk[1:], dtype=np.int32)
 
@@ -223,7 +240,6 @@ class HFTokenStreamingBatcher:
             "schedule_pos": self.schedule_pos,
             "total_tokens_emitted": self.total_tokens_emitted,
             "total_batches_emitted": self.total_batches_emitted,
-            "source_initial_skips": self.source_initial_skips,
             "sources": [s.state_dict() for s in self.sources],
         }
 
@@ -231,7 +247,6 @@ class HFTokenStreamingBatcher:
         self.schedule_pos = int(state.get("schedule_pos", 0))
         self.total_tokens_emitted = int(state.get("total_tokens_emitted", 0))
         self.total_batches_emitted = int(state.get("total_batches_emitted", 0))
-        self.source_initial_skips = [int(x) for x in state.get("source_initial_skips", [])]
         src_states = state.get("sources", [])
         if len(src_states) != len(self.sources):
             raise ValueError(
@@ -254,8 +269,8 @@ class StreamingTokenDatasetAdapter:
         rank: int,
         stream: int = 0,
     ):
-        del seed, step, rank, stream
-        return self.batcher.sample_batch(batch_size=batch_size, seq_len=seq_len)
+        del rank
+        return self.batcher.sample_batch(batch_size=batch_size, seq_len=seq_len, seed=seed, step=step, stream=stream)
 
 
 def data_state_path(ckpt_path: str, rank: int) -> str:

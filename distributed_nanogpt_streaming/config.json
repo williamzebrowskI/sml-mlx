@@ -6,7 +6,7 @@
       "split": "train",
       "token_field": "tokens",
       "weight": 1,
-      "shuffle_buffer": 0,
+      "shuffle_buffer": 1024,
       "trust_remote_code": false,
       "append_eos": false,
       "eos_token_id": 50256
