@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-from safetensors.numpy import load_file as safetensors_load
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -177,7 +176,7 @@ def _load_checkpoint(path: str, model: nn.Module) -> bool:
     if not os.path.exists(path):
         return False
 
-    flat = safetensors_load(path)
+    flat = mx.load(path)
 
     def assign(template: Any, prefix: str = ""):
         if isinstance(template, dict):
@@ -190,7 +189,7 @@ def _load_checkpoint(path: str, model: nn.Module) -> bool:
             key = prefix if prefix else "param"
             if key not in flat:
                 return template
-            value = mx.array(flat[key]).astype(template.dtype)
+            value = flat[key].astype(template.dtype)
             if value.shape != template.shape:
                 raise ValueError(
                     f"Checkpoint shape mismatch for {key}: file={value.shape}, model={template.shape}"
@@ -439,6 +438,25 @@ def main():
 
     parser.add_argument("--save-dir", type=str, default="/Users/williamzebrowski/sml-mlx/train/checkpoints")
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument(
+        "--checkpoint-rank",
+        type=int,
+        default=0,
+        help="Only this rank writes model checkpoints. Rank 0 keeps checkpoints on the home host.",
+    )
+    parser.set_defaults(save_stream_state=True)
+    parser.add_argument(
+        "--save-stream-state",
+        action="store_true",
+        dest="save_stream_state",
+        help="Write per-rank HF stream cursor state next to checkpoints.",
+    )
+    parser.add_argument(
+        "--no-save-stream-state",
+        action="store_false",
+        dest="save_stream_state",
+        help="Disable per-rank HF stream cursor checkpoints on worker hosts.",
+    )
     parser.add_argument("--resume", type=str, default="")
 
     if pre_args.config:
@@ -480,6 +498,8 @@ def main():
     print(f"[rank {rank}] host={socket.gethostname()} world={world}", flush=True)
     if args.expected_world is not None and world != args.expected_world:
         raise RuntimeError(f"Expected world={args.expected_world}, got {world}")
+    if args.checkpoint_rank < 0 or args.checkpoint_rank >= world:
+        raise RuntimeError(f"checkpoint_rank must be in [0, {world - 1}], got {args.checkpoint_rank}")
 
     model_dtype = _resolve_dtype(args.dtype)
     cfg = TransformerConfig(
@@ -505,12 +525,14 @@ def main():
             flush=True,
         )
         print(
-            f"[train] world={world} backend={args.backend} "
-            f"seq={args.max_seq_len} batch={args.batch_size} accum={args.grad_accum} "
-            f"opt_mode={'rank0_only' if args.optimizer_rank0_only else 'all_ranks'} "
-            f"collective_stream={args.collective_stream}",
-            flush=True,
-        )
+                f"[train] world={world} backend={args.backend} "
+                f"seq={args.max_seq_len} batch={args.batch_size} accum={args.grad_accum} "
+                f"opt_mode={'rank0_only' if args.optimizer_rank0_only else 'all_ranks'} "
+                f"collective_stream={args.collective_stream} "
+                f"checkpoint_rank={args.checkpoint_rank} "
+                f"save_stream_state={args.save_stream_state}",
+                flush=True,
+            )
 
     start_step = 0
     if args.resume:
@@ -725,17 +747,17 @@ def main():
                 "backend": args.backend,
                 "timestamp": time.time(),
             }
-            if rank == 0:
+            if rank == args.checkpoint_rank:
                 _save_checkpoint(ckpt_path, model, metadata)
                 print(f"[ckpt] saved {ckpt_path}", flush=True)
-            if args.data_mode == "hf_stream" and train_stream is not None:
+            if args.data_mode == "hf_stream" and train_stream is not None and args.save_stream_state:
                 ds_payload = {"step": step + 1, "stream_state": train_stream.state_dict()}
                 save_data_state(data_state_path(ckpt_path, rank), ds_payload)
-                if rank == 0:
+                if rank == args.checkpoint_rank:
                     print(f"[ckpt] saved data-state for all ranks at step {step+1}", flush=True)
 
     final_path = os.path.join(args.save_dir, "final.safetensors")
-    if rank == 0:
+    if rank == args.checkpoint_rank:
         metadata = {
             "step": args.max_steps,
             "args": vars(args),
@@ -747,7 +769,7 @@ def main():
         }
         _save_checkpoint(final_path, model, metadata)
         print(f"[done] saved {final_path}", flush=True)
-    if args.data_mode == "hf_stream" and train_stream is not None:
+    if args.data_mode == "hf_stream" and train_stream is not None and args.save_stream_state:
         save_data_state(
             data_state_path(final_path, rank),
             {"step": args.max_steps, "stream_state": train_stream.state_dict()},

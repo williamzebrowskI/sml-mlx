@@ -32,7 +32,19 @@ runs/sml-lm/*.safetensors
 runs/sml-lm-100m/*.safetensors
 model/checkpoints_333m
 model/checkpoints_sft_333m
+distributed_ring_train/checkpoints/
+distributed_nanochat_sft/checkpoints/
+distributed_nanogpt_pretrain/checkpoints/
+distributed_nanogpt_streaming/checkpoints/
 fineweb_sample.jsonl
+
+# Generated distributed training data / diagnostics
+distributed_nanogpt_pretrain/data/climbmix_probe/
+distributed_nanogpt_pretrain/data/smoke_gpt2/
+rdma_diag_report.json
+tb_live.dot
+tb_now.dot
+
 # Logs / experiment tracking
 wandb/
 logs/
@@ -44,4 +56,3 @@ logs/
 *.egg-info/
 dist/
 build/
-
