@@ -461,7 +461,7 @@ def main() -> None:
     loop_start = time.perf_counter()
 
     while iter_num < args.max_iters:
-        should_eval = args.eval_interval > 0 and (iter_num % args.eval_interval == 0)
+        should_eval = args.eval_interval > 0 and iter_num > 0 and (iter_num % args.eval_interval == 0)
         if should_eval:
             ckpt_path = os.path.join(args.save_dir, "ckpt.safetensors")
             train_loss = _estimate_loss(
@@ -532,6 +532,11 @@ def main() -> None:
                     "val": val_batcher.state_dict() if val_batcher is not None else None,
                 }
                 save_data_state(data_state_path(ckpt_path, rank), payload)
+            if world > 1:
+                # Keep all ranks aligned when rank 0 spends extra time saving
+                # checkpoints or generating a sample preview.
+                eval_sync = _all_sum(mx.array(1.0, dtype=mx.float32), stream_mode=args.collective_stream)
+                mx.eval(eval_sync)
             if args.eval_only:
                 break
             model.train()
