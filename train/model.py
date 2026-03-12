@@ -73,9 +73,6 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.bias)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
         self.rope = nn.RoPE(self.head_dim, base=cfg.rope_base)
-        self.causal_mask = nn.MultiHeadAttention.create_additive_causal_mask(
-            cfg.max_seq_len
-        )
         self.attention_impl = cfg.attention_impl
 
     def __call__(
@@ -107,7 +104,9 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(
                 f"Sequence length {q_len}/{k_len} exceeds max_seq_len={self.max_seq_len}"
             )
-        mask = self.causal_mask[:q_len, :k_len]
+        full_mask = nn.MultiHeadAttention.create_additive_causal_mask(k_len)
+        mask = full_mask[k_len - q_len : k_len, :k_len]
+        mask = mx.expand_dims(mx.expand_dims(mask, axis=0), axis=0).astype(q.dtype)
 
         scale = 1.0 / math.sqrt(self.head_dim)
         if self.attention_impl == "fast":
@@ -120,7 +119,7 @@ class CausalSelfAttention(nn.Module):
             )
         else:
             scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * scale
-            scores = scores + mask[None, None, :, :]
+            scores = scores + mask
             probs = mx.softmax(scores.astype(mx.float32), axis=-1).astype(v.dtype)
             attn = mx.matmul(probs, v)
         out = attn.transpose(0, 2, 1, 3).reshape(bsz, q_len, d_model)

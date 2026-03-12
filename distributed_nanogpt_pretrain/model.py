@@ -84,7 +84,6 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
-        self.causal_mask = nn.MultiHeadAttention.create_additive_causal_mask(cfg.block_size)
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, channels = x.shape
@@ -100,17 +99,19 @@ class CausalSelfAttention(nn.Module):
         v = split_heads(v)
 
         scale = 1.0 / math.sqrt(self.head_dim)
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(seqlen)
+        mask = mx.expand_dims(mx.expand_dims(mask, axis=0), axis=0).astype(q.dtype)
         if self.attention_impl == "fast" and self.dropout == 0.0:
             attn = mx.fast.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 scale=scale,
-                mask=self.causal_mask[:seqlen, :seqlen],
+                mask=mask,
             )
         else:
             scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * scale
-            scores = scores + self.causal_mask[:seqlen, :seqlen][None, None, :, :]
+            scores = scores + mask
             probs = mx.softmax(scores.astype(mx.float32), axis=-1).astype(v.dtype)
             probs = self.attn_dropout(probs)
             attn = mx.matmul(probs, v)
@@ -181,8 +182,6 @@ class GPT2LM(nn.Module):
             return
         self.config.block_size = block_size
         self.wpe.weight = self.wpe.weight[:block_size]
-        for block in self.h:
-            block.attn.causal_mask = block.attn.causal_mask[:block_size, :block_size]
         mx.eval(self.parameters())
 
     def logits(self, idx: mx.array) -> mx.array:
