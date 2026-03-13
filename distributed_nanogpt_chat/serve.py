@@ -39,6 +39,20 @@ MIN_TOP_K = 0
 MAX_TOP_K = 200
 MIN_MAX_TOKENS = 1
 MAX_MAX_TOKENS = 1024
+USER_START = "<|user_start|>\n"
+USER_END = "\n<|user_end|>\n"
+ASSISTANT_START = "<|assistant_start|>\n"
+ASSISTANT_END = "\n<|assistant_end|>\n"
+CONTROL_MARKERS = (
+    "<|assistant_end|>",
+    "<|assistant_start|>",
+    "<|user_start|>",
+    "<|user_end|>",
+    "<|python_start|>",
+    "<|python_end|>",
+    "<|output_start|>",
+    "<|output_end|>",
+)
 
 
 class ChatMessage(BaseModel):
@@ -159,6 +173,56 @@ def _build_prompt(messages: Iterable[ChatMessage]) -> str:
     return "\n".join(parts)
 
 
+def _detect_conversation_format(metadata: Dict[str, Any]) -> str:
+    cfg_path = str(metadata.get("args", {}).get("config", ""))
+    if "distributed_nanochat_gpt2_sft" in cfg_path:
+        return "sft"
+    return "plain"
+
+
+def _build_prompt_ids(
+    messages: Iterable[ChatMessage],
+    *,
+    tokenizer: AutoTokenizer,
+    conversation_format: str,
+) -> List[int]:
+    if conversation_format == "plain":
+        prompt = _build_prompt(messages)
+        return tokenizer.encode(prompt, add_special_tokens=False)
+
+    ids: List[int] = []
+    bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
+    if bos_id is not None:
+        ids.append(int(bos_id))
+
+    def add(text: str) -> None:
+        ids.extend(tokenizer.encode(text, add_special_tokens=False))
+
+    for message in messages:
+        content = message.content.strip()
+        if not content:
+            continue
+        if message.role == "user":
+            add(USER_START)
+            add(content)
+            add(USER_END)
+        elif message.role == "assistant":
+            add(ASSISTANT_START)
+            add(content)
+            add(ASSISTANT_END)
+    add(ASSISTANT_START)
+    return ids
+
+
+def _truncate_control_text(text: str) -> str:
+    stop_at = None
+    for marker in CONTROL_MARKERS + ("\nUser:", "\nAssistant:"):
+        idx = text.find(marker)
+        if idx != -1:
+            stop_at = idx if stop_at is None else min(stop_at, idx)
+    return text if stop_at is None else text[:stop_at]
+
+
 def validate_chat_request(request: ChatRequest) -> None:
     if not request.messages:
         raise HTTPException(status_code=400, detail="At least one message is required")
@@ -195,6 +259,7 @@ class GenerationSettings:
     repetition_penalty: float
     penalty_window: int
     no_repeat_ngram_size: int
+    conversation_format: str
     host: str
     port: int
 
@@ -208,13 +273,18 @@ class LocalCheckpointEngine:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         metadata = _load_checkpoint_metadata(settings.checkpoint_path)
-        model_args = metadata.get("model_args", {})
+        model_args = metadata.get("model_args") or metadata.get("config") or {}
         self.model = GPT2LM(GPT2Config(**model_args))
         flat = mx.load(str(settings.checkpoint_path))
         self.model.update(_tree_assign(self.model.parameters(), flat, prefix="model"))
         self.model.eval()
         mx.eval(self.model.parameters())
         self.metadata = metadata
+        self.conversation_format = (
+            settings.conversation_format
+            if settings.conversation_format != "auto"
+            else _detect_conversation_format(metadata)
+        )
 
     @property
     def stats(self) -> Dict[str, Any]:
@@ -230,6 +300,7 @@ class LocalCheckpointEngine:
             "n_embd": cfg.n_embd,
             "iter_num": self.metadata.get("iter_num"),
             "world": self.metadata.get("world"),
+            "conversation_format": self.conversation_format,
         }
 
     def stream_completion(
@@ -240,8 +311,11 @@ class LocalCheckpointEngine:
         top_k: int,
         max_tokens: int,
     ) -> Iterable[str]:
-        prompt = _build_prompt(messages)
-        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_ids = _build_prompt_ids(
+            messages,
+            tokenizer=self.tokenizer,
+            conversation_format=self.conversation_format,
+        )
         if not prompt_ids:
             raise ValueError("Prompt tokenized to empty sequence")
 
@@ -249,7 +323,7 @@ class LocalCheckpointEngine:
         generated_ids = list(prompt_ids)
         response_ids: List[int] = []
         last_clean_text = ""
-        stop_markers = ("\nUser:", "\nAssistant:")
+        assistant_end_ids = self.tokenizer.encode(ASSISTANT_END, add_special_tokens=False)
 
         for _ in range(max_tokens):
             ctx_ids = generated_ids[-self.model.config.block_size :]
@@ -271,24 +345,21 @@ class LocalCheckpointEngine:
 
             generated_ids.append(next_id)
             response_ids.append(next_id)
+            if assistant_end_ids and response_ids[-len(assistant_end_ids) :] == assistant_end_ids:
+                break
 
             current_text = self.tokenizer.decode(response_ids, clean_up_tokenization_spaces=False)
             if current_text.endswith("\ufffd"):
                 continue
 
-            stop_at = None
-            for marker in stop_markers:
-                idx = current_text.find(marker)
-                if idx != -1:
-                    stop_at = idx if stop_at is None else min(stop_at, idx)
-            visible_text = current_text if stop_at is None else current_text[:stop_at]
+            visible_text = _truncate_control_text(current_text)
 
             new_text = visible_text[len(last_clean_text) :]
             if new_text:
                 yield f"data: {json.dumps({'token': new_text}, ensure_ascii=False)}\n\n"
                 last_clean_text = visible_text
 
-            if stop_at is not None:
+            if visible_text != current_text:
                 break
 
         yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
@@ -372,6 +443,7 @@ def parse_args() -> GenerationSettings:
     parser.add_argument("--repetition-penalty", type=float, default=1.2)
     parser.add_argument("--penalty-window", type=int, default=128)
     parser.add_argument("--no-repeat-ngram-size", type=int, default=3)
+    parser.add_argument("--conversation-format", type=str, default="auto", choices=["auto", "plain", "sft"])
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -384,6 +456,7 @@ def parse_args() -> GenerationSettings:
         repetition_penalty=args.repetition_penalty,
         penalty_window=args.penalty_window,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
+        conversation_format=args.conversation_format,
         host=args.host,
         port=args.port,
     )
