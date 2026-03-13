@@ -1,0 +1,58 @@
+{
+  "base_ckpt": "/Users/williamzebrowski/sml-mlx/distributed_nanogpt_streaming/checkpoints/run_climbmix_shuffled_v3/final.safetensors",
+  "load_optimizer": true,
+  "tokenizer_name": "gpt2",
+  "train_sources": [
+    {
+      "kind": "identity_jsonl",
+      "path": "/Users/williamzebrowski/sml-mlx/distributed_nanochat_gpt2_sft/data/train_snapshot.jsonl",
+      "weight": 1
+    }
+  ],
+  "val_sources": [
+    {
+      "kind": "identity_jsonl",
+      "path": "/Users/williamzebrowski/sml-mlx/distributed_nanochat_gpt2_sft/data/val_snapshot.jsonl",
+      "weight": 1
+    }
+  ],
+  "shuffle_buffer": 0,
+  "buffer_size": 16,
+  "trust_remote_code": false,
+  "block_size": 1024,
+  "vocab_size": 50304,
+  "n_layer": 12,
+  "n_head": 12,
+  "n_embd": 768,
+  "dropout": 0.0,
+  "bias": false,
+  "attention_impl": "fast",
+  "dtype": "bfloat16",
+  "device_batch_size": 1,
+  "total_batch_size": 8192,
+  "learning_rate": 2e-5,
+  "min_lr_ratio": 0.1,
+  "warmup_steps": 100,
+  "max_iters": 5000,
+  "weight_decay": 0.01,
+  "beta1": 0.9,
+  "beta2": 0.95,
+  "grad_clip": 1.0,
+  "ignore_index": -100,
+  "eval_interval": 200,
+  "eval_iters": 10,
+  "log_interval": 10,
+  "save_every": 500,
+  "save_dir": "/Users/williamzebrowski/sml-mlx/distributed_nanochat_gpt2_sft/checkpoints/sft_snapshot_v1",
+  "sample_prompt": "A good teacher should",
+  "sample_max_new_tokens": 200,
+  "sample_temperature": 0.8,
+  "sample_top_k": 40,
+  "backend": "ring",
+  "collective_stream": "cpu",
+  "expected_world": 4,
+  "seed": 1337,
+  "checkpoint_rank": 0,
+  "optimizer_rank0_only": true,
+  "resume": ""
+}

@@ -435,6 +435,7 @@ def main() -> None:
     parser.add_argument("--sample-max-new-tokens", type=int, default=200)
     parser.add_argument("--sample-temperature", type=float, default=0.8)
     parser.add_argument("--sample-top-k", type=int, default=40)
+    parser.add_argument("--trace-first-step", action="store_true")
     parser.add_argument("--backend", type=str, default="ring")
     parser.add_argument("--collective-stream", type=str, default="cpu", choices=["cpu", "default"])
     parser.add_argument("--expected-world", type=int, default=4)
@@ -622,30 +623,53 @@ def main() -> None:
         t0 = time.perf_counter()
 
         for _ in range(grad_accum):
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=sample_batch", flush=True)
             x, y = train_batcher.sample_batch(batch_size=args.device_batch_size, seq_len=args.block_size)
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=sample_done", flush=True)
             _sync_ranks(world, args.collective_stream)
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=sample_sync_done", flush=True)
             loss, grads = step_and_grad(x, y)
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=fwd_bwd_done", flush=True)
             mx.eval(loss)
             total_loss_local += float(loss.item())
             grads_acc = grads if grads_acc is None else _tree_add(grads_acc, grads)
 
+        if args.trace_first_step and step == start_step:
+            print(f"[rank {rank}] trace step={step+1} stage=grad_accum_done", flush=True)
         grads_acc = _tree_scale(grads_acc, 1.0 / float(grad_accum))
         if world > 1:
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=allreduce_grads", flush=True)
             grads_acc = _allreduce_tree(grads_acc, world, stream_mode=args.collective_stream)
 
+        if args.trace_first_step and step == start_step:
+            print(f"[rank {rank}] trace step={step+1} stage=clip_grads", flush=True)
         grads_acc, grad_norm = _clip_grads(grads_acc, args.grad_clip)
         lr_t = lr_for_step(step)
         if args.optimizer_rank0_only and world > 1:
             if rank == 0:
+                if args.trace_first_step and step == start_step:
+                    print(f"[rank {rank}] trace step={step+1} stage=optimizer_update_rank0", flush=True)
                 optimizer.learning_rate = lr_t
                 optimizer.update(model, grads_acc)
                 mx.eval(model.parameters(), optimizer.state)
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=broadcast_model", flush=True)
             model.update(_broadcast_tree_from_rank0(model.parameters(), rank, world, args.collective_stream))
+            mx.eval(model.parameters())
         else:
+            if args.trace_first_step and step == start_step:
+                print(f"[rank {rank}] trace step={step+1} stage=optimizer_update_all", flush=True)
             optimizer.learning_rate = lr_t
             optimizer.update(model, grads_acc)
             mx.eval(model.parameters(), optimizer.state)
 
+        if args.trace_first_step and step == start_step:
+            print(f"[rank {rank}] trace step={step+1} stage=reduce_step_loss", flush=True)
         step_loss = mx.array(total_loss_local / float(grad_accum), dtype=mx.float32)
         if world > 1:
             step_loss = _all_sum(step_loss, stream_mode=args.collective_stream) / world
@@ -713,6 +737,8 @@ def main() -> None:
         if should_save:
             _sync_ranks(world, args.collective_stream)
 
+    _sync_ranks(world, args.collective_stream)
+    mx.eval(model.parameters(), optimizer.state)
     if rank == args.checkpoint_rank:
         final_path = os.path.join(args.save_dir, "final.safetensors")
         _save_training_checkpoint(
@@ -730,6 +756,7 @@ def main() -> None:
             },
         )
         print(f"[done] saved {final_path}", flush=True)
+    _sync_ranks(world, args.collective_stream)
 
 
 if __name__ == "__main__":

@@ -116,7 +116,7 @@ class BaseCursor:
         raise NotImplementedError
 
 
-class HFStreamingCursor(BaseCursor):
+class HFMapCursor(BaseCursor):
     def __init__(
         self,
         spec: SourceSpec,
@@ -133,8 +133,8 @@ class HFStreamingCursor(BaseCursor):
         self.trust_remote_code = trust_remote_code
         self.epoch = 0
         self.index = 0
+        self.base_ds = self._build_dataset()
         self.ds = None
-        self.it: Optional[Iterator[Dict[str, Any]]] = None
         self._reset()
 
     def _dataset_args(self) -> tuple[str, Optional[str], str]:
@@ -163,34 +163,25 @@ class HFStreamingCursor(BaseCursor):
             name,
             config,
             split=split,
-            streaming=True,
             trust_remote_code=self.trust_remote_code,
         )
-        buffer_size = self.spec.shuffle_buffer
-        if buffer_size > 0:
-            ds = ds.shuffle(buffer_size=buffer_size, seed=self.seed + self.epoch)
-        if hasattr(ds, "set_epoch"):
-            ds.set_epoch(self.epoch)
+        if self.world > 1:
+            ds = ds.shard(num_shards=self.world, index=self.rank, contiguous=False)
         return ds
 
     def _reset(self) -> None:
-        self.ds = self._build_dataset()
-        self.it = iter(self.ds)
+        self.ds = self.base_ds
+        if self.spec.split == "train":
+            self.ds = self.ds.shuffle(seed=self.seed + self.epoch)
         self.index = 0
 
     def next_conversation(self) -> Dict[str, Any]:
-        while True:
-            try:
-                row = next(self.it)
-            except StopIteration:
-                self.epoch += 1
-                self._reset()
-                continue
-            idx = self.index
-            self.index += 1
-            if self.world > 1 and (idx % self.world) != self.rank:
-                continue
-            return self._normalize(row)
+        if self.index >= len(self.ds):
+            self.epoch += 1
+            self._reset()
+        row = self.ds[self.index]
+        self.index += 1
+        return self._normalize(row)
 
 
 class JSONLinesCursor(BaseCursor):
@@ -346,7 +337,7 @@ def build_cursor(
     trust_remote_code: bool,
 ) -> BaseCursor:
     if spec.kind in {"smoltalk", "mmlu", "gsm8k"}:
-        return HFStreamingCursor(
+        return HFMapCursor(
             spec,
             rank=rank,
             world=world,
