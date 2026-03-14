@@ -33,6 +33,12 @@ Run:
 /Users/williamzebrowski/sml-mlx/distributed_nanochat_gpt2_sft/launch_sft.sh
 ```
 
+Post-SFT eval:
+
+```bash
+/Users/williamzebrowski/sml-mlx/distributed_nanochat_gpt2_sft/launch_chat_eval.sh
+```
+
 Useful overrides:
 
 ```bash

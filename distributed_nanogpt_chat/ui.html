@@ -32,12 +32,23 @@
         .header {
             background-color: #ffffff;
             padding: 1.25rem 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
         }
 
         .header-left {
             display: flex;
             align-items: center;
             gap: 0.75rem;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            flex-shrink: 0;
         }
 
         .header-logo {
@@ -61,6 +72,27 @@
         .header-meta {
             font-size: 0.82rem;
             color: #6b7280;
+        }
+
+        .model-label {
+            font-size: 0.8rem;
+            color: #6b7280;
+            white-space: nowrap;
+        }
+
+        .model-select {
+            border: 1px solid #d1d5db;
+            border-radius: 0.55rem;
+            padding: 0.5rem 0.7rem;
+            font-size: 0.9rem;
+            background-color: #ffffff;
+            color: #111827;
+            outline: none;
+        }
+
+        .model-select:focus {
+            border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
         }
 
         .new-conversation-btn {
@@ -261,8 +293,12 @@
             <img class="header-logo" src="/logo.svg" alt="nanochat logo">
             <div class="header-copy">
                 <h1>nanochat</h1>
-                <div class="header-meta">checkpoint: __MODEL_LABEL__</div>
+                <div class="header-meta" id="headerMeta">model: __DEFAULT_MODEL_LABEL__</div>
             </div>
+        </div>
+        <div class="header-right">
+            <label class="model-label" for="modelSelect">Model</label>
+            <select id="modelSelect" class="model-select" title="Choose model"></select>
         </div>
     </div>
 
@@ -295,17 +331,81 @@
         const chatWrapper = document.getElementById("chatWrapper");
         const chatInput = document.getElementById("chatInput");
         const sendButton = document.getElementById("sendButton");
+        const headerMeta = document.getElementById("headerMeta");
+        const modelSelect = document.getElementById("modelSelect");
 
+        const modelOptions = __MODEL_OPTIONS_JSON__;
+        const conversationState = {};
+
+        let selectedModelId = "__DEFAULT_MODEL_ID__";
         let messages = [];
         let isGenerating = false;
         let currentTemperature = __DEFAULT_TEMPERATURE__;
         let currentTopK = __DEFAULT_TOP_K__;
         let currentMaxTokens = __DEFAULT_MAX_TOKENS__;
 
+        function getModelById(modelId) {
+            return modelOptions.find((model) => model.id === modelId) || modelOptions[0];
+        }
+
+        function ensureConversation(modelId) {
+            if (!conversationState[modelId]) {
+                conversationState[modelId] = [];
+            }
+            return conversationState[modelId];
+        }
+
+        function updateHeaderMeta() {
+            const model = getModelById(selectedModelId);
+            headerMeta.textContent = `model: ${model.label} · ${model.checkpoint_name}`;
+        }
+
+        function populateModelSelect() {
+            modelSelect.innerHTML = "";
+            for (const model of modelOptions) {
+                const option = document.createElement("option");
+                option.value = model.id;
+                option.textContent = `${model.label} · ${model.checkpoint_name}`;
+                modelSelect.appendChild(option);
+            }
+            modelSelect.value = selectedModelId;
+            updateHeaderMeta();
+        }
+
+        function renderConversation() {
+            chatWrapper.innerHTML = "";
+            for (let i = 0; i < messages.length; i++) {
+                const message = messages[i];
+                if (message.role === "user" || message.role === "assistant") {
+                    addMessage(message.role, message.content, i);
+                } else {
+                    addMessage(message.role, message.content);
+                }
+            }
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function switchModel(modelId) {
+            selectedModelId = modelId;
+            messages = ensureConversation(selectedModelId);
+            updateHeaderMeta();
+            renderConversation();
+            sendButton.disabled = !chatInput.value.trim() || isGenerating;
+            chatInput.focus();
+        }
+
         chatInput.addEventListener("input", function() {
             this.style.height = "auto";
             this.style.height = Math.min(this.scrollHeight, 200) + "px";
             sendButton.disabled = !this.value.trim() || isGenerating;
+        });
+
+        modelSelect.addEventListener("change", function() {
+            if (isGenerating) {
+                this.value = selectedModelId;
+                return;
+            }
+            switchModel(this.value);
         });
 
         function handleKeyDown(event) {
@@ -326,6 +426,7 @@
 
         function newConversation() {
             messages = [];
+            conversationState[selectedModelId] = messages;
             chatWrapper.innerHTML = "";
             chatInput.value = "";
             chatInput.style.height = "auto";
@@ -377,6 +478,7 @@
             chatInput.style.height = "auto";
             chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + "px";
             messages = messages.slice(0, messageIndex);
+            conversationState[selectedModelId] = messages;
 
             const allMessages = chatWrapper.querySelectorAll(".message");
             for (let i = messageIndex; i < allMessages.length; i++) {
@@ -399,6 +501,7 @@
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
+                        model_id: selectedModelId,
                         messages: messages,
                         temperature: currentTemperature,
                         top_k: currentTopK,
@@ -438,6 +541,7 @@
 
                 const assistantMessageIndex = messages.length;
                 messages.push({ role: "assistant", content: fullResponse });
+                conversationState[selectedModelId] = messages;
                 assistantContent.setAttribute("data-message-index", assistantMessageIndex);
                 assistantContent.setAttribute("title", "Click to regenerate this response");
                 assistantContent.addEventListener("click", function() {
@@ -459,6 +563,7 @@
             if (messageToRegenerate.role !== "assistant") return;
 
             messages = messages.slice(0, messageIndex);
+            conversationState[selectedModelId] = messages;
             const allMessages = chatWrapper.querySelectorAll(".message");
             for (let i = messageIndex; i < allMessages.length; i++) {
                 allMessages[i].remove();
@@ -524,7 +629,7 @@
                     "/topk <value> - Set top-k (0-200)\n" +
                     "/maxtokens - Show current max tokens\n" +
                     "/maxtokens <value> - Set max tokens (1-1024)\n" +
-                    "/clear - Clear conversation\n" +
+                    "/clear - Clear current model conversation\n" +
                     "/help - Show this help message"
                 );
                 return true;
@@ -548,10 +653,14 @@
 
             const userMessageIndex = messages.length;
             messages.push({ role: "user", content: message });
+            conversationState[selectedModelId] = messages;
             addMessage("user", message, userMessageIndex);
             await generateAssistantResponse();
         }
 
+        messages = ensureConversation(selectedModelId);
+        populateModelSelect();
+        renderConversation();
         sendButton.disabled = false;
         chatInput.focus();
 
