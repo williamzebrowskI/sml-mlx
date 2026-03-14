@@ -113,7 +113,19 @@ def _allreduce_tree_chunked(tree: Any, world: int, stream_mode: str, sync_bytes:
         if isinstance(v, tuple):
             return tuple(visit(val) for val in v)
         if isinstance(v, mx.array):
-            out = _all_sum(v, stream_mode=stream_mode) / world
+            if _array_nbytes(v) > sync_bytes:
+                flat = mx.reshape(v, (-1,))
+                itemsize = max(1, _array_nbytes(v) // max(1, flat.shape[0]))
+                elems_per_chunk = max(1, sync_bytes // itemsize)
+                pieces = []
+                for start in range(0, flat.shape[0], elems_per_chunk):
+                    stop = min(flat.shape[0], start + elems_per_chunk)
+                    piece = _all_sum(flat[start:stop], stream_mode=stream_mode) / world
+                    mx.eval(piece)
+                    pieces.append(piece)
+                out = mx.reshape(mx.concatenate(pieces, axis=0), v.shape)
+            else:
+                out = _all_sum(v, stream_mode=stream_mode) / world
             pending.append(out)
             pending_bytes += _array_nbytes(out)
             if pending_bytes >= sync_bytes:
@@ -660,8 +672,13 @@ def main() -> None:
             mx.eval(loss)
             total_loss_local += float(loss.item())
             grads_acc = grads if grads_acc is None else _tree_add(grads_acc, grads)
+            # Materialize accumulated grads per microstep so the first
+            # distributed allreduce does not inherit the entire lazy backward
+            # graph in one Metal command buffer.
+            mx.eval(grads_acc)
 
         grads_acc = _tree_scale(grads_acc, 1.0 / float(local_accum))
+        mx.eval(grads_acc)
         if world > 1:
             if args.trace_first_step and iter_num == 0:
                 print(f"[rank {rank}] trace iter={iter_num} stage=allreduce_grads", flush=True)
