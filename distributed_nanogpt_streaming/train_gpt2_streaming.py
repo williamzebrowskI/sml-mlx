@@ -242,6 +242,11 @@ def _generate_sample_text(
     return tokenizer.decode(out_ids, clean_up_tokenization_spaces=False)
 
 
+def _seed_rngs(seed: int) -> None:
+    mx.random.seed(seed)
+    np.random.seed(seed)
+
+
 def main() -> None:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", type=str, default="")
@@ -332,8 +337,6 @@ def main() -> None:
         raise RuntimeError(f"checkpoint_rank must be in [0, {world - 1}]")
 
     seed_offset = rank
-    mx.random.seed(args.seed + seed_offset)
-    np.random.seed(args.seed + seed_offset)
 
     train_sources = parse_token_source_configs(args.train_sources)
     if not train_sources:
@@ -368,11 +371,18 @@ def main() -> None:
         model_args["block_size"] = 1024
 
     cfg = GPT2Config(**model_args)
+    # Keep scratch initialization identical across ranks so we can avoid an
+    # expensive full-parameter broadcast before the first step.
+    _seed_rngs(args.seed)
     model = GPT2LM(cfg)
     model_dtype = _resolve_dtype(args.dtype)
     _cast_model_floats(model, model_dtype)
     mx.eval(model.parameters())
     model.train()
+
+    # Restore rank-local RNG streams for data sampling and any later stochastic
+    # operations once the model weights have been initialized.
+    _seed_rngs(args.seed + seed_offset)
 
     if args.block_size < model.config.block_size:
         model.crop_block_size(args.block_size)
@@ -428,8 +438,9 @@ def main() -> None:
         if rank == 0:
             _load_hf_gpt2(model, args.init_from, dropout=args.dropout)
 
-    model.update(_broadcast_tree_from_rank0(model.parameters(), rank, world, args.collective_stream))
-    mx.eval(model.parameters())
+    if args.init_from != "scratch":
+        model.update(_broadcast_tree_from_rank0(model.parameters(), rank, world, args.collective_stream))
+        mx.eval(model.parameters())
     if args.init_from == "resume":
         optimizer.state = _broadcast_tree_from_rank0(optimizer.state, rank, world, args.collective_stream)
         step_arr = _all_sum(mx.array(float(iter_num if rank == 0 else 0.0), dtype=mx.float32), stream_mode=args.collective_stream)
