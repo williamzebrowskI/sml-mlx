@@ -595,13 +595,6 @@ def main() -> None:
             )
             if args.trace_first_step and iter_num == 0:
                 print(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=sample_done", flush=True)
-            if world > 1:
-                if args.trace_first_step and iter_num == 0:
-                    print(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=sample_sync", flush=True)
-                ready = _all_sum(mx.array(1.0, dtype=mx.float32), stream_mode=args.collective_stream)
-                mx.eval(ready)
-                if args.trace_first_step and iter_num == 0:
-                    print(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=sample_sync_done", flush=True)
             if args.trace_first_step and iter_num == 0:
                 print(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=fwd_bwd", flush=True)
             loss, grads = step_and_grad(x, y)
