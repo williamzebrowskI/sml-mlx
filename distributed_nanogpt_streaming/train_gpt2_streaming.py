@@ -294,6 +294,7 @@ def main() -> None:
     parser.add_argument("--save-stream-state", action="store_true", dest="save_stream_state")
     parser.add_argument("--no-save-stream-state", action="store_false", dest="save_stream_state")
     parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--data-warmup-batches", type=int, default=0)
     parser.add_argument("--trace-first-step", action="store_true")
     parser.add_argument("--sample-prompt", type=str, default="")
     parser.add_argument("--sample-max-new-tokens", type=int, default=0)
@@ -457,6 +458,20 @@ def main() -> None:
     sample_enabled = bool(args.sample_prompt and args.sample_max_new_tokens > 0)
     if sample_enabled and rank == args.checkpoint_rank:
         sample_tokenizer = _load_sample_tokenizer(args.sample_tokenizer_name)
+
+    if args.data_warmup_batches > 0:
+        for warm_idx in range(args.data_warmup_batches):
+            train_data.sample_batch(
+                batch_size=args.batch_size,
+                seq_len=model.config.block_size,
+                seed=args.seed,
+                step=-1,
+                rank=rank,
+                stream=10_000 + warm_idx,
+            )
+        if rank == 0:
+            print(f"[data] warmed {args.data_warmup_batches} train batches per rank", flush=True)
+
     if rank == 0:
         print(f"[rank {rank}] host={socket.gethostname()} world={world}", flush=True)
         print(f"[tokens_per_iter] {tokens_per_iter:,}", flush=True)
