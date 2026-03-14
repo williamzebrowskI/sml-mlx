@@ -543,6 +543,16 @@ def main() -> None:
     tokens_per_iter = args.gradient_accumulation_steps * args.batch_size * model.config.block_size
     num_params = count_parameters(model)
     param_bytes = 2 if model_dtype in (mx.float16, mx.bfloat16) else 4
+    trace_path = os.path.join(args.save_dir, f"trace_rank{rank}.log")
+
+    def trace_stage(message: str) -> None:
+        if not args.trace_first_step:
+            return
+        print(message, flush=True)
+        Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(trace_path, "a") as f:
+            f.write(message + "\n")
+
     sample_tokenizer: Optional[Any] = None
     sample_enabled = bool(args.sample_prompt and args.sample_max_new_tokens > 0)
     if sample_enabled and rank == args.checkpoint_rank:
@@ -688,7 +698,7 @@ def main() -> None:
 
         for micro in range(local_accum):
             if args.trace_first_step and iter_num == 0:
-                print(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=sample_batch", flush=True)
+                trace_stage(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=sample_batch")
             x, y = train_data.sample_batch(
                 batch_size=args.batch_size,
                 seq_len=model.config.block_size,
@@ -698,9 +708,9 @@ def main() -> None:
                 stream=micro,
             )
             if args.trace_first_step and iter_num == 0:
-                print(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=sample_done", flush=True)
+                trace_stage(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=sample_done")
             if args.trace_first_step and iter_num == 0:
-                print(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=fwd_bwd", flush=True)
+                trace_stage(f"[rank {rank}] trace iter={iter_num} micro={micro} stage=fwd_bwd")
             loss, grads = step_and_grad(x, y)
             mx.eval(loss)
             total_loss_local += float(loss.item())
@@ -714,7 +724,7 @@ def main() -> None:
         mx.eval(grads_acc)
         if world > 1:
             if args.trace_first_step and iter_num == 0:
-                print(f"[rank {rank}] trace iter={iter_num} stage=allreduce_grads", flush=True)
+                trace_stage(f"[rank {rank}] trace iter={iter_num} stage=allreduce_grads")
             grads_acc = _allreduce_tree_chunked(
                 grads_acc,
                 world,
@@ -722,22 +732,22 @@ def main() -> None:
                 sync_bytes=max(1, int(args.grad_allreduce_sync_mb)) * 1024 * 1024,
             )
             if args.trace_first_step and iter_num == 0:
-                print(f"[rank {rank}] trace iter={iter_num} stage=allreduce_done", flush=True)
+                trace_stage(f"[rank {rank}] trace iter={iter_num} stage=allreduce_done")
 
         if args.trace_first_step and iter_num == 0:
-            print(f"[rank {rank}] trace iter={iter_num} stage=clip_grads", flush=True)
+            trace_stage(f"[rank {rank}] trace iter={iter_num} stage=clip_grads")
         grads_acc, grad_norm = _clip_grads(grads_acc, args.grad_clip)
         lr_t = lr_for_step(iter_num) if args.decay_lr else args.learning_rate
         optimizer.learning_rate = lr_t
         if args.trace_first_step and iter_num == 0:
-            print(f"[rank {rank}] trace iter={iter_num} stage=optimizer_update", flush=True)
+            trace_stage(f"[rank {rank}] trace iter={iter_num} stage=optimizer_update")
         optimizer.update(model, grads_acc)
         mx.eval(model.parameters(), optimizer.state)
 
         step_loss = mx.array(total_loss_local / float(local_accum), dtype=mx.float32)
         if world > 1:
             if args.trace_first_step and iter_num == 0:
-                print(f"[rank {rank}] trace iter={iter_num} stage=loss_allreduce", flush=True)
+                trace_stage(f"[rank {rank}] trace iter={iter_num} stage=loss_allreduce")
             step_loss = _all_sum(step_loss, stream_mode=args.collective_stream) / world
         mx.eval(step_loss)
         step_loss_value = float(step_loss.item())
