@@ -600,9 +600,20 @@ def main() -> None:
     running_loss = None
     loop_start = time.perf_counter()
 
+    skip_resume_boundary_once = args.init_from == "resume"
+
     while iter_num < args.max_iters:
         should_eval = args.eval_interval > 0 and iter_num > 0 and (iter_num % args.eval_interval == 0)
         should_save = args.save_interval > 0 and iter_num > 0 and (iter_num % args.save_interval == 0)
+        if skip_resume_boundary_once and (should_eval or should_save):
+            if rank == 0:
+                print(
+                    f"[resume] skipping boundary eval/save at iter {iter_num} because the checkpoint already captured that step",
+                    flush=True,
+                )
+            should_eval = False
+            should_save = False
+        skip_resume_boundary_once = False
         if should_eval or should_save:
             latest_ckpt_path = os.path.join(args.save_dir, "ckpt.safetensors") if should_save else None
             step_ckpt_path = _step_checkpoint_path(args.save_dir, iter_num) if should_save else None
