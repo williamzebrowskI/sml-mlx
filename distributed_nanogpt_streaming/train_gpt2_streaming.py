@@ -724,6 +724,10 @@ def main() -> None:
         mx.eval(grads_acc)
         if world > 1:
             if args.trace_first_step and iter_num == 0:
+                trace_stage(f"[rank {rank}] trace iter={iter_num} stage=allreduce_rendezvous")
+            ready_sync = _all_sum(mx.array(1.0, dtype=mx.float32), stream_mode=args.collective_stream)
+            mx.eval(ready_sync)
+            if args.trace_first_step and iter_num == 0:
                 trace_stage(f"[rank {rank}] trace iter={iter_num} stage=allreduce_grads")
             grads_acc = _allreduce_tree_chunked(
                 grads_acc,
