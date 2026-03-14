@@ -97,6 +97,39 @@ def _allreduce_tree_chunked(tree: Any, world: int, stream_mode: str, sync_bytes:
     pending: list[mx.array] = []
     pending_bytes = 0
 
+    def concat_eager(chunks: list[mx.array]) -> mx.array:
+        if len(chunks) == 1:
+            return chunks[0]
+
+        group_bytes = 0
+        group: list[mx.array] = []
+        partials: list[mx.array] = []
+        for chunk in chunks:
+            group.append(chunk)
+            group_bytes += _array_nbytes(chunk)
+            if group_bytes >= sync_bytes:
+                part = mx.concatenate(group, axis=0)
+                mx.eval(part)
+                partials.append(part)
+                group = []
+                group_bytes = 0
+        if group:
+            part = mx.concatenate(group, axis=0) if len(group) > 1 else group[0]
+            mx.eval(part)
+            partials.append(part)
+
+        while len(partials) > 1:
+            next_partials: list[mx.array] = []
+            for idx in range(0, len(partials), 2):
+                if idx + 1 < len(partials):
+                    part = mx.concatenate([partials[idx], partials[idx + 1]], axis=0)
+                    mx.eval(part)
+                    next_partials.append(part)
+                else:
+                    next_partials.append(partials[idx])
+            partials = next_partials
+        return partials[0]
+
     def flush() -> None:
         nonlocal pending, pending_bytes
         if pending:
@@ -123,7 +156,7 @@ def _allreduce_tree_chunked(tree: Any, world: int, stream_mode: str, sync_bytes:
                     piece = _all_sum(flat[start:stop], stream_mode=stream_mode) / world
                     mx.eval(piece)
                     pieces.append(piece)
-                out = mx.reshape(mx.concatenate(pieces, axis=0), v.shape)
+                out = mx.reshape(concat_eager(pieces), v.shape)
             else:
                 out = _all_sum(v, stream_mode=stream_mode) / world
             pending.append(out)
