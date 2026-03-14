@@ -555,6 +555,7 @@ def main() -> None:
 
     sample_tokenizer: Optional[Any] = None
     sample_enabled = bool(args.sample_prompt and args.sample_max_new_tokens > 0)
+    distributed_sample_disabled = sample_enabled and world > 1
     if sample_enabled and rank == args.checkpoint_rank:
         sample_tokenizer = _load_sample_tokenizer(args.sample_tokenizer_name)
 
@@ -585,6 +586,11 @@ def main() -> None:
             flush=True,
         )
         print(f"[data] train_sources={len(train_sources)} val_sources={len(val_sources)}", flush=True)
+        if distributed_sample_disabled:
+            print(
+                "[sample] disabled during distributed pretraining; use an offline probe on saved checkpoints instead",
+                flush=True,
+            )
 
     lr_for_step = _build_lr_schedule(
         base_lr=args.learning_rate,
@@ -672,7 +678,7 @@ def main() -> None:
                     _copy_checkpoint_artifacts(step_ckpt_path, latest_ckpt_path)
                     print(f"[ckpt] saved {step_ckpt_path}", flush=True)
                     print(f"[ckpt] updated {latest_ckpt_path}", flush=True)
-                    if sample_enabled and rank == args.checkpoint_rank:
+                    if sample_enabled and rank == args.checkpoint_rank and not distributed_sample_disabled:
                         sample_text = _generate_sample_text(
                             model=model,
                             tokenizer=sample_tokenizer,
@@ -683,6 +689,8 @@ def main() -> None:
                         )
                         print(f"[sample {iter_num:7d}] prompt={args.sample_prompt!r}", flush=True)
                         print(sample_text, flush=True)
+                    elif sample_enabled and rank == args.checkpoint_rank and distributed_sample_disabled:
+                        print(f"[sample {iter_num:7d}] skipped in distributed mode", flush=True)
             else:
                 save_ckpt = False
             if save_ckpt and args.save_stream_state:
