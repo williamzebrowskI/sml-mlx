@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import socket
 import sys
 import time
@@ -103,6 +104,19 @@ def _load_training_checkpoint(path: str, model: GPT2LM, optimizer: optim.AdamW) 
         with open(meta_path, "r") as f:
             metadata = json.load(f)
     return metadata
+
+
+def _copy_checkpoint_artifacts(src_path: str, dst_path: str) -> None:
+    Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, dst_path)
+    src_meta = src_path + ".json"
+    dst_meta = dst_path + ".json"
+    if os.path.exists(src_meta):
+        shutil.copy2(src_meta, dst_meta)
+
+
+def _step_checkpoint_path(save_dir: str, step: int) -> str:
+    return os.path.join(save_dir, f"step_{int(step):07d}.safetensors")
 
 
 def _load_hf_gpt2(model: GPT2LM, model_type: str, *, dropout: float) -> None:
@@ -463,7 +477,8 @@ def main() -> None:
     while iter_num < args.max_iters:
         should_eval = args.eval_interval > 0 and iter_num > 0 and (iter_num % args.eval_interval == 0)
         if should_eval:
-            ckpt_path = os.path.join(args.save_dir, "ckpt.safetensors")
+            latest_ckpt_path = os.path.join(args.save_dir, "ckpt.safetensors")
+            step_ckpt_path = _step_checkpoint_path(args.save_dir, iter_num)
             train_loss = _estimate_loss(
                 model=model,
                 dataset=train_data,
@@ -499,20 +514,23 @@ def main() -> None:
                 if val_loss is not None:
                     best_val_loss = min(best_val_loss, val_loss)
                 if save_ckpt:
+                    ckpt_meta = {
+                        "iter_num": iter_num,
+                        "best_val_loss": best_val_loss,
+                        "model_args": model_args,
+                        "world": world,
+                        "backend": args.backend,
+                        "timestamp": time.time(),
+                    }
                     _save_training_checkpoint(
-                        ckpt_path,
+                        step_ckpt_path,
                         model,
                         optimizer,
-                        {
-                            "iter_num": iter_num,
-                            "best_val_loss": best_val_loss,
-                            "model_args": model_args,
-                            "world": world,
-                            "backend": args.backend,
-                            "timestamp": time.time(),
-                        },
+                        ckpt_meta,
                     )
-                    print(f"[ckpt] saved {ckpt_path}", flush=True)
+                    _copy_checkpoint_artifacts(step_ckpt_path, latest_ckpt_path)
+                    print(f"[ckpt] saved {step_ckpt_path}", flush=True)
+                    print(f"[ckpt] updated {latest_ckpt_path}", flush=True)
                     if sample_enabled and rank == args.checkpoint_rank:
                         sample_text = _generate_sample_text(
                             model=model,
@@ -531,7 +549,10 @@ def main() -> None:
                     "train": train_batcher.state_dict(),
                     "val": val_batcher.state_dict() if val_batcher is not None else None,
                 }
-                save_data_state(data_state_path(ckpt_path, rank), payload)
+                step_state_path = data_state_path(step_ckpt_path, rank)
+                latest_state_path = data_state_path(latest_ckpt_path, rank)
+                save_data_state(step_state_path, payload)
+                _copy_checkpoint_artifacts(step_state_path, latest_state_path)
             if world > 1:
                 # Keep all ranks aligned when rank 0 spends extra time saving
                 # checkpoints or generating a sample preview.
