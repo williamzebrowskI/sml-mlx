@@ -688,15 +688,23 @@ def main() -> None:
                 stream_mode=args.collective_stream,
                 sync_bytes=max(1, int(args.grad_allreduce_sync_mb)) * 1024 * 1024,
             )
+            if args.trace_first_step and iter_num == 0:
+                print(f"[rank {rank}] trace iter={iter_num} stage=allreduce_done", flush=True)
 
+        if args.trace_first_step and iter_num == 0:
+            print(f"[rank {rank}] trace iter={iter_num} stage=clip_grads", flush=True)
         grads_acc, grad_norm = _clip_grads(grads_acc, args.grad_clip)
         lr_t = lr_for_step(iter_num) if args.decay_lr else args.learning_rate
         optimizer.learning_rate = lr_t
+        if args.trace_first_step and iter_num == 0:
+            print(f"[rank {rank}] trace iter={iter_num} stage=optimizer_update", flush=True)
         optimizer.update(model, grads_acc)
         mx.eval(model.parameters(), optimizer.state)
 
         step_loss = mx.array(total_loss_local / float(local_accum), dtype=mx.float32)
         if world > 1:
+            if args.trace_first_step and iter_num == 0:
+                print(f"[rank {rank}] trace iter={iter_num} stage=loss_allreduce", flush=True)
             step_loss = _all_sum(step_loss, stream_mode=args.collective_stream) / world
         mx.eval(step_loss)
         step_loss_value = float(step_loss.item())
