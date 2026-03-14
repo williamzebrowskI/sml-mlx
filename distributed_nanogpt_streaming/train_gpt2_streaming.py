@@ -251,6 +251,7 @@ def main() -> None:
     parser.add_argument("--train-sources", type=str, default="")
     parser.add_argument("--val-sources", type=str, default="")
     parser.add_argument("--eval-interval", type=int, default=2000)
+    parser.add_argument("--save-interval", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-iters", type=int, default=20)
     parser.add_argument("--eval-only", action="store_true")
@@ -476,9 +477,12 @@ def main() -> None:
 
     while iter_num < args.max_iters:
         should_eval = args.eval_interval > 0 and iter_num > 0 and (iter_num % args.eval_interval == 0)
-        if should_eval:
-            latest_ckpt_path = os.path.join(args.save_dir, "ckpt.safetensors")
-            step_ckpt_path = _step_checkpoint_path(args.save_dir, iter_num)
+        should_save = args.save_interval > 0 and iter_num > 0 and (iter_num % args.save_interval == 0)
+        if should_eval or should_save:
+            latest_ckpt_path = os.path.join(args.save_dir, "ckpt.safetensors") if should_save else None
+            step_ckpt_path = _step_checkpoint_path(args.save_dir, iter_num) if should_save else None
+            train_loss = None
+            val_loss = None
             train_loss = _estimate_loss(
                 model=model,
                 dataset=train_data,
@@ -490,9 +494,8 @@ def main() -> None:
                 rank=rank,
                 world=world,
                 collective_stream=args.collective_stream,
-            )
-            val_loss = None
-            if val_data is not None:
+            ) if should_eval else None
+            if should_eval and val_data is not None:
                 val_loss = _estimate_loss(
                     model=model,
                     dataset=val_data,
@@ -505,15 +508,17 @@ def main() -> None:
                     world=world,
                     collective_stream=args.collective_stream,
                 )
+            improved_val = bool(should_eval and val_loss is not None and val_loss < best_val_loss)
             if rank == 0:
-                msg = f"[eval {iter_num:7d}] train_loss={train_loss:.4f}"
-                if val_loss is not None:
-                    msg += f" val_loss={val_loss:.4f}"
-                print(msg, flush=True)
-                save_ckpt = args.always_save_checkpoint or (val_loss is not None and val_loss < best_val_loss)
-                if val_loss is not None:
+                if should_eval:
+                    msg = f"[eval {iter_num:7d}] train_loss={train_loss:.4f}"
+                    if val_loss is not None:
+                        msg += f" val_loss={val_loss:.4f}"
+                    print(msg, flush=True)
+                if should_eval and val_loss is not None:
                     best_val_loss = min(best_val_loss, val_loss)
-                if save_ckpt:
+                save_ckpt = bool(should_save and (args.always_save_checkpoint or improved_val))
+                if save_ckpt and latest_ckpt_path is not None and step_ckpt_path is not None:
                     ckpt_meta = {
                         "iter_num": iter_num,
                         "best_val_loss": best_val_loss,
@@ -553,7 +558,7 @@ def main() -> None:
                 latest_state_path = data_state_path(latest_ckpt_path, rank)
                 save_data_state(step_state_path, payload)
                 _copy_checkpoint_artifacts(step_state_path, latest_state_path)
-            if world > 1:
+            if save_ckpt and world > 1:
                 # Keep all ranks aligned when rank 0 spends extra time saving
                 # checkpoints or generating a sample preview.
                 eval_sync = _all_sum(mx.array(1.0, dtype=mx.float32), stream_mode=args.collective_stream)
