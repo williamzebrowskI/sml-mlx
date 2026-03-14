@@ -83,6 +83,49 @@ def _broadcast_tree_from_rank0(tree: Any, rank: int, world: int, stream_mode: st
     return visit(tree)
 
 
+def _array_nbytes(x: mx.array) -> int:
+    itemsize = getattr(x.dtype, "size", None)
+    if itemsize is None:
+        itemsize = np.dtype(str(x.dtype)).itemsize
+    return int(itemsize) * int(np.prod(x.shape))
+
+
+def _allreduce_tree_chunked(tree: Any, world: int, stream_mode: str, sync_bytes: int) -> Any:
+    if world == 1:
+        return tree
+
+    pending: list[mx.array] = []
+    pending_bytes = 0
+
+    def flush() -> None:
+        nonlocal pending, pending_bytes
+        if pending:
+            mx.eval(pending)
+            pending = []
+            pending_bytes = 0
+
+    def visit(v: Any) -> Any:
+        nonlocal pending_bytes
+        if isinstance(v, dict):
+            return {k: visit(val) for k, val in v.items()}
+        if isinstance(v, list):
+            return [visit(val) for val in v]
+        if isinstance(v, tuple):
+            return tuple(visit(val) for val in v)
+        if isinstance(v, mx.array):
+            out = _all_sum(v, stream_mode=stream_mode) / world
+            pending.append(out)
+            pending_bytes += _array_nbytes(out)
+            if pending_bytes >= sync_bytes:
+                flush()
+            return out
+        return v
+
+    reduced = visit(tree)
+    flush()
+    return reduced
+
+
 def _save_training_checkpoint(path: str, model: GPT2LM, optimizer: optim.AdamW, metadata: Dict[str, Any]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     tensors: Dict[str, mx.array] = {}
@@ -295,6 +338,7 @@ def main() -> None:
     parser.add_argument("--no-save-stream-state", action="store_false", dest="save_stream_state")
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--data-warmup-batches", type=int, default=0)
+    parser.add_argument("--grad-allreduce-sync-mb", type=int, default=16)
     parser.add_argument("--trace-first-step", action="store_true")
     parser.add_argument("--sample-prompt", type=str, default="")
     parser.add_argument("--sample-max-new-tokens", type=int, default=0)
@@ -621,7 +665,12 @@ def main() -> None:
         if world > 1:
             if args.trace_first_step and iter_num == 0:
                 print(f"[rank {rank}] trace iter={iter_num} stage=allreduce_grads", flush=True)
-            grads_acc = _allreduce_tree(grads_acc, world, stream_mode=args.collective_stream)
+            grads_acc = _allreduce_tree_chunked(
+                grads_acc,
+                world,
+                stream_mode=args.collective_stream,
+                sync_bytes=max(1, int(args.grad_allreduce_sync_mb)) * 1024 * 1024,
+            )
 
         grads_acc, grad_norm = _clip_grads(grads_acc, args.grad_clip)
         lr_t = lr_for_step(iter_num) if args.decay_lr else args.learning_rate
