@@ -8,4 +8,6 @@ exec "$ROOT/.venv/bin/mlx.launch" \
   --python "$ROOT/.venv/bin/python" \
   -- "$ROOT/distributed_nanogpt_streaming/train_gpt2_streaming.py" \
   --config "$ROOT/distributed_nanogpt_streaming/config.json" \
+  --data-warmup-batches 2 \
+  --grad-allreduce-sync-mb 1 \
   "$@"
