@@ -683,7 +683,7 @@ def main() -> None:
                 latest_state_path = data_state_path(latest_ckpt_path, rank)
                 save_data_state(step_state_path, payload)
                 _copy_checkpoint_artifacts(step_state_path, latest_state_path)
-            if save_ckpt and world > 1:
+            if should_save and world > 1:
                 # Keep all ranks aligned when rank 0 spends extra time saving
                 # checkpoints or generating a sample preview.
                 eval_sync = _all_sum(mx.array(1.0, dtype=mx.float32), stream_mode=args.collective_stream)
