@@ -2,6 +2,9 @@
 set -euo pipefail
 
 ROOT="/Users/williamzebrowski/sml-mlx"
+mkdir -p \
+  "$ROOT/distributed_nanogpt_streaming/checkpoints/sft_d14_qa_v1" \
+  "$ROOT/distributed_nanogpt_streaming/.hf_cache_sft/datasets"
 exec "$ROOT/.venv/bin/mlx.launch" \
   --hostfile "$ROOT/distributed_nanogpt_streaming/hosts.json" \
   --backend ring \

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import urllib.request
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from datasets import load_dataset
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_HF_DATASETS_CACHE = ROOT / "distributed_nanogpt_streaming" / ".hf_cache_sft" / "datasets"
 
 
 IDENTITY_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl"
@@ -159,11 +164,16 @@ class HFMapCursor(BaseCursor):
 
     def _build_dataset(self):
         name, config, split = self._dataset_args()
+        cache_dir = os.environ.get("HF_DATASETS_CACHE")
+        if not cache_dir:
+            DEFAULT_HF_DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
+            cache_dir = str(DEFAULT_HF_DATASETS_CACHE)
         ds = load_dataset(
             name,
             config,
             split=split,
             trust_remote_code=self.trust_remote_code,
+            cache_dir=cache_dir,
         )
         if self.world > 1:
             ds = ds.shard(num_shards=self.world, index=self.rank, contiguous=False)
